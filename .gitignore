@@ -1,0 +1,4 @@
+runs/
+workplace/FFmpeg/build/
+__pycache__/
+*.pyc

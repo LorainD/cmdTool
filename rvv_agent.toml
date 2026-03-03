@@ -1,0 +1,21 @@
+[ffmpeg]
+root = "workplace/FFmpeg"
+build_dir = "build"
+# 默认使用 workspace 内的 configure：<ffmpeg_root>/configure
+# 如果你确实要用另一棵源码树的 configure，再打开这一行
+# configure_path = "/home/yuhe/project/original/FFmpeg/configure"
+configure_extra_args = []
+
+[toolchain]
+cross_prefix = "riscv64-unknown-linux-gnu-"
+arch = "riscv64"
+target_os = "linux"
+cpu = "rv64gcv"
+extra_cflags = "-march=rv64gcv -mabi=lp64d -O3"
+extra_ldflags = "-static"
+
+[llm]
+base_url = "https://api.openai.com/v1"
+api_key_env = "LLM_API_KEY"
+model = "gpt-5.2-mini"
+temperature = 0.2
