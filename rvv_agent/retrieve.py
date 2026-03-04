@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import AppConfig
@@ -18,6 +18,7 @@ class RetrievalResult:
     raw_text: str
     llm_used: bool
     error: str | None = None
+    existing_rvv: list[str] = field(default_factory=list)  # RVV files already in the repo
 
 
 def _extract_json(raw: str) -> dict:
@@ -53,13 +54,33 @@ def _fallback_selection(discovery: Discovery) -> dict:
     }
 
 
+def _scan_existing_rvv(ffmpeg_root: Path, module: str) -> list[str]:
+    """Scan libavcodec/riscv/ for files whose name contains the module name.
+    Returns relative paths (relative to ffmpeg_root).
+    """
+    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"
+    if not riscv_dir.exists():
+        return []
+    module_lower = module.lower()
+    found: list[str] = []
+    for f in sorted(riscv_dir.iterdir()):
+        if f.is_file() and module_lower in f.name.lower():
+            found.append(str(f.relative_to(ffmpeg_root)).replace("\\", "/"))
+    return found
+
+
 def select_references(cfg: AppConfig, ffmpeg_root: Path, intent_or_symbol: "Intent | str") -> RetrievalResult:
     if isinstance(intent_or_symbol, str):
         symbol = intent_or_symbol
+        module = intent_or_symbol
         terms = [symbol]
     else:
         symbol = intent_or_symbol.symbol
+        module = intent_or_symbol.module
         terms = intent_or_symbol.search_terms
+
+    # Check for existing RVV implementations FIRST, before full text search.
+    existing_rvv = _scan_existing_rvv(ffmpeg_root, module)
 
     # Multi-term search: for 'sbrdsp.neg_odd_64' this searches func_name ('neg_odd_64'),
     # module ('sbrdsp'), and the dotted form – so sbrdsp.c + neg_odd_64 hits are all found
@@ -80,10 +101,13 @@ def select_references(cfg: AppConfig, ffmpeg_root: Path, intent_or_symbol: "Inte
         data = _extract_json(raw)
         if not isinstance(data, dict):
             raise ValueError("retrieval json is not object")
-        return RetrievalResult(discovery=discovery, selected=data, raw_text=raw, llm_used=True)
+        return RetrievalResult(discovery=discovery, selected=data, raw_text=raw,
+                               llm_used=True, existing_rvv=existing_rvv)
     except LlmError as e:
         fb = _fallback_selection(discovery)
-        return RetrievalResult(discovery=discovery, selected=fb, raw_text=str(e), llm_used=False, error=str(e))
+        return RetrievalResult(discovery=discovery, selected=fb, raw_text=str(e),
+                               llm_used=False, error=str(e), existing_rvv=existing_rvv)
     except Exception as e:
         fb = _fallback_selection(discovery)
-        return RetrievalResult(discovery=discovery, selected=fb, raw_text=repr(e), llm_used=False, error=repr(e))
+        return RetrievalResult(discovery=discovery, selected=fb, raw_text=repr(e),
+                               llm_used=False, error=repr(e), existing_rvv=existing_rvv)

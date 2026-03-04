@@ -198,7 +198,7 @@ if checkasm fail:
 在/workplace/FFmpeg下创建build文件夹，在该文件夹下进行build操作
 交叉编译命令应该为
 ```
-/home/yuhe/project/original/FFmpeg/configure   --cross-prefix=riscv64-unknown-linux-gnu-   --arch=riscv64   --target-os=linux   --enable-cross-compile   --cpu=rv64gcv   --extra-cflags="-march=rv64gcv -mabi=lp64d -O3"   --extra-ldflags="-static"   --disable-shared   --enable-static
+/home/yuhe/project/cmdTool/workplace/FFmpeg/configure   --cross-prefix=riscv64-unknown-linux-gnu-   --arch=riscv64   --target-os=linux   --enable-cross-compile   --cpu=rv64gcv   --extra-cflags="-march=rv64gcv -mabi=lp64d -O3"   --extra-ldflags="-static"   --disable-shared   --enable-static
 
 ```
 ```

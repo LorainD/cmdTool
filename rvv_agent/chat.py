@@ -295,9 +295,19 @@ def run_chat(cfg: AppConfig) -> int:
             selected_files.extend(_list(k))
         selected_files = list(dict.fromkeys(selected_files))
 
+        if retrieval.existing_rvv:
+            print("\n已发现以下现有 RVV 实现文件（将作为增量基础）：")
+            for _r in retrieval.existing_rvv:
+                print(f"  [existing] {_r}")
+
         print("\n检索/选择出的参考文件：")
         for p in selected_files:
             print(f"- {p}")
+
+        # Always include existing RVV files in selected_files so they are used as context
+        for _r in retrieval.existing_rvv:
+            if _r not in selected_files:
+                selected_files.append(_r)
 
         # Use cached file list for this symbol if already refined
         if symbol in state.ref_files:
@@ -331,69 +341,115 @@ def run_chat(cfg: AppConfig) -> int:
         gen = generate_with_llm(cfg, symbol, analysis.analysis,
                                existing_files_map=existing_map or None)
 
+        # ── Step 1: Apply generated files to FFmpeg workspace ─────────────────
         if state.apply_ok is None:
             state.apply_ok = prompt_yes_no(
-                "\n是否允许本次对话把生成文件写入 FFmpeg workspace？",
-                default=False,
+                "\n是否把生成文件写入 FFmpeg workspace（workplace/FFmpeg）？",
             )
 
-        # materialize to runs/ for traceability (no apply yet; apply happens inside build retry loop)
+        # materialize to runs/artifacts/ for traceability; also apply if confirmed
         materialized = materialize_package(
             run_dir,
             ffmpeg_root,
             gen.package,
-            apply=False,
+            apply=bool(state.apply_ok),
         )
+        if state.apply_ok:
+            print("\n已将生成文件写入 FFmpeg workspace：")
+            for _mp in materialized:
+                _mp_r = Path(_mp)
+                if ffmpeg_root in _mp_r.parents or _mp_r.is_relative_to(ffmpeg_root):
+                    print(f"  → {_mp_r}")
+        else:
+            print("\n已将生成文件保存到 runs/（未写入 FFmpeg）。")
 
         exec_result = ExecResult()
+        import os
+        jobs = max(1, os.cpu_count() or 1)
+        build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
 
-        # Build steps (configure + make checkasm)
+        # ── Step 2: Cross-compile (configure + make checkasm) ─────────────────
         if state.build_ok is None:
-            import os
-
-            jobs = max(1, os.cpu_count() or 1)
-            build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
-            print("\n交叉编译命令（将会在 build 目录执行）：")
-            print(f"- cwd: {build_dir}")
-            print("- " + fmt_argv(configure_argv(cfg, ffmpeg_root)))
-            print("- " + fmt_argv(make_checkasm_argv(jobs=jobs)))
+            print("\n交叉编译计划：")
+            print(f"  build 目录 : {build_dir}")
+            print(f"  configure  : {fmt_argv(configure_argv(cfg, ffmpeg_root))}")
+            print(f"  make       : {fmt_argv(make_checkasm_argv(jobs=jobs))}")
             state.build_ok = prompt_yes_no(
                 "\n是否现在执行 configure + 构建 checkasm？",
-                default=False,
             )
 
         MAX_BUILD_RETRIES = 3
         build_attempt = 0
         if state.build_ok:
-            import os
-            jobs = max(1, os.cpu_count() or 1)
-            build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
             ensure_dir(build_dir)
-            exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
+            print(f"\n已创建/确认 build 目录：{build_dir}")
 
-            while build_attempt < MAX_BUILD_RETRIES:
-                materialize_package(run_dir, ffmpeg_root, gen.package,
-                                    apply=True, attempt=build_attempt)
-                exec_result.make_checkasm = run_make_checkasm(build_dir, jobs)
+            # ── configure + make retry loop (shared counter) ──────────────────
+            while build_attempt <= MAX_BUILD_RETRIES:
+                # ─ configure phase ─
+                print(f"\n正在运行 configure（第 {build_attempt+1} 次尝试，输出实时显示）…")
+                exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
+
+                if exec_result.configure.returncode != 0:
+                    cfg_err = exec_result.configure.stdout[:4000]
+                    print(f"\nconfigure 失败（returncode={exec_result.configure.returncode}）")
+                    build_attempt += 1
+                    if build_attempt > MAX_BUILD_RETRIES:
+                        print(f"\nconfigure 已连续失败 {MAX_BUILD_RETRIES} 次，请人工处理。")
+                        print(f"错误信息片段：\n{cfg_err[:800]}\n")
+                        break
+                    if not prompt_yes_no(
+                        f"\n是否让 LLM 分析 configure 错误并迭代修复（第 {build_attempt}/{MAX_BUILD_RETRIES} 次）？",
+                        default=True,
+                    ):
+                        print("已取消迭代，本次构建结束。")
+                        break
+                    print(f"\n正在让 LLM 修复（configure 错误）…")
+                    fix_result = fix_generation_with_llm(cfg, symbol, cfg_err, gen.package)
+                    if fix_result.error:
+                        print(f"LLM 修复请求失败：{fix_result.error}")
+                        break
+                    gen = fix_result
+                    write_text(run_dir / f"fix_attempt{build_attempt}_configure_raw.txt", gen.raw_text)
+                    if state.apply_ok:
+                        materialize_package(run_dir, ffmpeg_root, gen.package,
+                                            apply=True, attempt=build_attempt)
+                        print(f"已将修复后的文件重新写入 FFmpeg workspace（configure 修复 #{build_attempt}）")
+                    continue  # retry configure with fixed files
+
+                # ─ make phase ─
+                print("\nconfigure 完成，开始构建 checkasm…")
+                exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
                 if exec_result.make_checkasm.returncode == 0:
-                    print(f"\n构建成功（第 {build_attempt+1} 次尝试）")
+                    print(f"\n构建成功（第 {build_attempt+1} 次尝试）✓")
                     break
-                # Build failed
-                build_attempt += 1
-                err_text = (exec_result.make_checkasm.stdout +
+
+                # make failed
+                make_err = (exec_result.make_checkasm.stdout +
                             exec_result.make_checkasm.stderr)[:4000]
-                if build_attempt >= MAX_BUILD_RETRIES:
+                build_attempt += 1
+                if build_attempt > MAX_BUILD_RETRIES:
                     print(f"\n构建连续失败 {MAX_BUILD_RETRIES} 次，请人工处理。")
-                    print(f"错误信息片段：\n{err_text[:800]}\n")
+                    print(f"错误信息片段：\n{make_err[:800]}\n")
                     break
-                print(f"\n构建失败（第 {build_attempt} 次尝试），正在让 LLM 修复…")
-                fix_result = fix_generation_with_llm(cfg, symbol, err_text, gen.package)
+                if not prompt_yes_no(
+                    f"\n是否让 LLM 分析 make 错误并迭代修复（第 {build_attempt}/{MAX_BUILD_RETRIES} 次）？",
+                    default=True,
+                ):
+                    print("已取消迭代，本次构建结束。")
+                    break
+                print(f"\n正在让 LLM 修复（make 错误）…")
+                fix_result = fix_generation_with_llm(cfg, symbol, make_err, gen.package)
                 if fix_result.error:
                     print(f"LLM 修复请求失败：{fix_result.error}")
                     break
                 gen = fix_result
-                write_text(run_dir / f"fix_attempt{build_attempt}_raw.txt",
-                           gen.raw_text)
+                write_text(run_dir / f"fix_attempt{build_attempt}_raw.txt", gen.raw_text)
+                if state.apply_ok:
+                    materialize_package(run_dir, ffmpeg_root, gen.package,
+                                        apply=True, attempt=build_attempt)
+                    print(f"已将修复后的文件重新写入 FFmpeg workspace（make 修复 #{build_attempt}）")
+                # continue loop: re-run configure then make with fixed files
 
         # Board steps
         if cfg.board.enabled:

@@ -24,6 +24,8 @@ class ToolchainConfig:
     cpu: str = "rv64gcv"
     extra_cflags: str = "-march=rv64gcv -mabi=lp64d -O3"
     extra_ldflags: str = "-static"
+    # Prepended to PATH when running configure/make so the cross-compiler is found.
+    extra_path: str = ""
 
 
 @dataclass
@@ -90,6 +92,7 @@ def load_config(path: Path | None) -> AppConfig:
             cfg.toolchain.cpu = str(tc.get("cpu", cfg.toolchain.cpu))
             cfg.toolchain.extra_cflags = str(tc.get("extra_cflags", cfg.toolchain.extra_cflags))
             cfg.toolchain.extra_ldflags = str(tc.get("extra_ldflags", cfg.toolchain.extra_ldflags))
+            cfg.toolchain.extra_path = str(tc.get("extra_path", cfg.toolchain.extra_path))
 
         ff = raw.get("ffmpeg", {})
         if isinstance(ff, dict):

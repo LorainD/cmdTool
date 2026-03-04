@@ -61,3 +61,37 @@ def run_cmd(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
     )
 
     return CmdResult(argv=list(argv), returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
+
+
+def run_cmd_stream(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> CmdResult:
+    """Run a command, printing stdout/stderr in real time and returning full captured output."""
+    import sys
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd) if cwd else None,
+        env=merged,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # merge stderr into stdout for unified stream
+    )
+
+    out_lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        out_lines.append(line)
+    proc.wait()
+    combined = "".join(out_lines)
+    return CmdResult(argv=list(argv), returncode=proc.returncode, stdout=combined, stderr="")
