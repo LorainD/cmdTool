@@ -5,8 +5,8 @@ import json
 
 def system_prompt() -> str:
     return (
-        "你是一个面向 FFmpeg 的 RISC-V Vector (RVV) SIMD 迁移助手。"
-        "你输出必须工程化、可执行、可落盘。"
+        "你是一个面向 FFmpeg 的 RISC-V Vector (RVV) SIMD 迁移助手，同时也可以进行普通技术对话。"
+        "当且仅当用户明确要做迁移/生成/编译/运行等动作时，你才进入迁移任务流程。"
         "在涉及修改代码、编译、scp、远程运行前，必须让人类确认。"
     )
 
@@ -18,19 +18,19 @@ def intent_prompt(user_text: str) -> str:
 
 输出 JSON schema：
 {{
-  \"action\": \"migrate\",
-  \"symbol\": \"ff_xxx\",
+  \"action\": \"chat\" | \"migrate\",
+  \"symbol\": \"任意 C 函数/算子标识符\" | \"\" ,
   \"notes\": \"...\"
 }}
 
-要求：
-- 如果用户给了明确的函数名（比如 ff_vp8_idct16_add），symbol 必须直接使用它。
-- action 当前只允许 migrate。
+判定规则（尽量保守）：
+- 只有当用户明确表达“迁移/生成 RVV/做 SIMD 优化/改 FFmpeg 代码/编译/跑 checkasm/把算子迁移到 RVV”等意图时，action=\"migrate\"。
+- 否则 action=\"chat\"。
+- 如果 action=migrate 且能从输入中确定要迁移的函数/算子名（可能不是 ff_*），symbol 填该标识符；否则 symbol 为空串。
 """
 
 
 def retrieval_prompt(symbol: str, grouped: dict, matches: list) -> str:
-    # Keep payload small.
     grouped_s = json.dumps(grouped, ensure_ascii=False)
     matches_s = "\n".join(str(m) for m in matches)
 

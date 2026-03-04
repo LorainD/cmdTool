@@ -80,6 +80,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     cfg = load_config(_resolve_path(args.config))
+
     ffmpeg_root = Path(args.ffmpeg_root) if args.ffmpeg_root else cfg.ffmpeg.root
     ffmpeg_root = ffmpeg_root.expanduser().resolve()
 

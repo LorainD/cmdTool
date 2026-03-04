@@ -53,6 +53,10 @@
 ./bin/rvv-agent chat
 ```
 
+说明：`chat` 模式默认是自由对话，并在启动时打印一次 `LLM status/probe_ok` 来确认是否真的连上外部 LLM。
+退出：按 Ctrl+C，或输入 `/exit`。
+当输入中被识别到迁移意图（例如同时出现 `FFmpeg`/`libav` 语境 + `迁移/rvv/simd/checkasm/编译/生成` 等关键词，且能从文本中抽取出要迁移的函数/算子名——不一定是 `ff_*`）时，才会进入迁移流水线并逐步请求确认。
+
 - （可选）开启 scp/板端运行：编辑 `rvv_agent.toml` 的 `[board]`，填好 `user/host/remote_dir`，然后把 `enabled=true`。
 
 产物：
@@ -64,7 +68,8 @@
 
 ## LLM 配置（必须）
 
-本工具走 OpenAI-compatible 的 `POST /v1/chat/completions`。
+本工具走 OpenAI-compatible 的 Chat Completions 接口：`POST <你的endpoint>/chat/completions`。
+注意：`llm.base_url` 必须填写“完整 endpoint URL”（以 `/chat/completions` 结尾），工具不会再自动拼接 `/v1` 或 `/chat/completions`。
 
 1) 设置 API Key 环境变量（默认变量名是 `LLM_API_KEY`）：
 
@@ -84,3 +89,9 @@ export LLM_API_KEY='...'
 - 把 `analysis.json` 的 schema 固化（并做 `analysis_skills/` 校验脚本）
 - 给 `generate` 阶段加上“最小可编译”约束：从 init/Makefile 自动提取宏名与函数注册点
 - 把 checkasm 运行方式补齐（qemu / ssh 到板子）并把失败时的 diff 输出写进 report
+
+## LLM 多配置（profiles）
+
+- 在 rvv_agent.toml 中使用 `[llm_profiles.<name>]` 定义多套 `base_url + model`。
+- 运行时用 `--llm-profile <name>` 选择；或设置环境变量 `RVV_AGENT_LLM_PROFILE`。
+- 注意：`llm.base_url`/`llm_profiles.*.base_url` 必须是完整 endpoint URL（以 `/chat/completions` 结尾），工具不会自动拼接。
