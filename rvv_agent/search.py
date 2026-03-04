@@ -31,6 +31,44 @@ def _iter_source_files(ffmpeg_root: Path) -> Iterable[Path]:
         yield path
 
 
+def find_symbol_multi(
+    ffmpeg_root: Path,
+    terms: list[str],
+    *,
+    primary: str | None = None,
+    max_matches: int = 400,
+) -> Discovery:
+    """Search for multiple terms and merge results (deduplicating by file+line).
+
+    *primary* is the canonical symbol name stored on the returned Discovery
+    (defaults to ``terms[0]``).
+    """
+    seen_lines: dict[str, set[int]] = {}  # rel_path -> set of line numbers added
+    all_matches: list[Match] = []
+
+    for term in terms:
+        token_re = re.compile(r"\b" + re.escape(term) + r"\b")
+        for file in _iter_source_files(ffmpeg_root):
+            rel = str(file.relative_to(ffmpeg_root)).replace("\\", "/")
+            try:
+                text = file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if term not in text:
+                continue
+            lines_seen = seen_lines.setdefault(rel, set())
+            for i, line in enumerate(text.splitlines(), start=1):
+                if i in lines_seen:
+                    continue
+                if token_re.search(line):
+                    lines_seen.add(i)
+                    all_matches.append(Match(file=rel, line=i, text=line.strip()))
+                    if len(all_matches) >= max_matches:
+                        return Discovery(symbol=primary or terms[0], matches=all_matches)
+
+    return Discovery(symbol=primary or terms[0], matches=all_matches)
+
+
 def find_symbol(ffmpeg_root: Path, symbol: str, *, max_matches: int = 400) -> Discovery:
     token_re = re.compile(r"\b" + re.escape(symbol) + r"\b")
 

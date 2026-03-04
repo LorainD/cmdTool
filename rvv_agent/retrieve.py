@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AppConfig
+from .intent import Intent
 from .llm import LlmError, LlmMessage, chat_completion
 from .prompts import retrieval_prompt, system_prompt
-from .search import Discovery, find_symbol, group_files
+from .search import Discovery, find_symbol, find_symbol_multi, group_files
 
 
 @dataclass
@@ -52,8 +53,21 @@ def _fallback_selection(discovery: Discovery) -> dict:
     }
 
 
-def select_references(cfg: AppConfig, ffmpeg_root: Path, symbol: str) -> RetrievalResult:
-    discovery = find_symbol(ffmpeg_root, symbol)
+def select_references(cfg: AppConfig, ffmpeg_root: Path, intent_or_symbol: "Intent | str") -> RetrievalResult:
+    if isinstance(intent_or_symbol, str):
+        symbol = intent_or_symbol
+        terms = [symbol]
+    else:
+        symbol = intent_or_symbol.symbol
+        terms = intent_or_symbol.search_terms
+
+    # Multi-term search: for 'sbrdsp.neg_odd_64' this searches func_name ('neg_odd_64'),
+    # module ('sbrdsp'), and the dotted form – so sbrdsp.c + neg_odd_64 hits are all found
+    # even though the dotted literal never appears verbatim in source code.
+    if len(terms) > 1:
+        discovery = find_symbol_multi(ffmpeg_root, terms, primary=symbol)
+    else:
+        discovery = find_symbol(ffmpeg_root, symbol)
     grouped = group_files(discovery)
 
     messages = [

@@ -37,6 +37,8 @@ def write_report(
     materialized: list[Path],
     exec_result: ExecResult,
     interaction: dict | None = None,
+    ref_files: list[str] | None = None,
+    refine_history: list[dict] | None = None,
 ) -> Path:
     ensure_dir(run_dir)
 
@@ -46,7 +48,18 @@ def write_report(
     md.append("# rvv-agent run report\n")
     md.append("## Symbol\n\n" + f"- {discovery.symbol}\n")
 
-    md.append("## Plan\n\n" + "\n".join(f"- {s}" for s in plan.steps) + "\n")
+    md.append("## Plan\n\n" + "\n".join(f"{i+1:02d}. {s}" for i, s in enumerate(plan.steps)) + "\n")
+
+    if ref_files:
+        md.append("## Reference Files\n\n" + "\n".join(f"- {f}" for f in ref_files) + "\n")
+
+    if refine_history:
+        md.append("## Refine History\n")
+        for entry in refine_history:
+            stage = entry.get("stage", "?")
+            feedback = entry.get("feedback", "")
+            md.append(f"- [{stage}] {feedback}")
+        md.append("")
 
     if interaction:
         md.append("## Interaction\n\n```json\n" + json.dumps(interaction, ensure_ascii=False, indent=2) + "\n```\n")

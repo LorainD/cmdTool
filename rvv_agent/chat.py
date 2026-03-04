@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .analyze import analyze_with_llm
@@ -15,24 +15,52 @@ from .exec import (
     run_configure,
     run_make_checkasm,
 )
-from .generate import generate_with_llm, materialize_package
+from .generate import (
+    fix_generation_with_llm,
+    generate_with_llm,
+    materialize_package,
+    scan_existing_rvv_content,
+)
 from .intent import parse_intent
 from .interactive import prompt_secret, prompt_text, prompt_yes_no
 from .llm import LlmMessage, chat_completion, probe_llm
-from .plan import fixed_plan
-from .prompts import system_prompt
+from .plan import fixed_plan, llm_plan
+from .prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
 from .retrieve import select_references
 from .util import ensure_dir, fmt_argv, now_id, slug, write_text
 
 
 @dataclass
-class SessionState:
+class SessionContext:
+    """Persistent, human-editable context carried across all turns in a session.
+
+    Three categories of context are kept alive throughout the whole session:
+      1. plan        – migration steps (LLM-generated, human-refineable)
+      2. ref_files   – selected reference file list (LLM-generated, human-refineable)
+      3. credentials – board SSH password (entered once, reused silently)
+
+    Plus the one-time human decisions that are remembered session-wide:
+      apply_ok, build_ok, scp_ok, run_on_board_ok
+    """
+    # ── sticky user decisions (asked once per session) ──
     apply_ok: bool | None = None
     build_ok: bool | None = None
     scp_ok: bool | None = None
     run_on_board_ok: bool | None = None
+
+    # ── credential (entered once, never re-prompted) ──
     scp_password: str | None = None
+
+    # ── persistent, refineable context ──
+    # Keyed by symbol so multiple migrations in one session stay independent.
+    plans: dict[str, list[str]] = field(default_factory=dict)        # symbol → steps
+    ref_files: dict[str, list[str]] = field(default_factory=dict)    # symbol → file list
+    refine_history: list[dict] = field(default_factory=list)          # [{stage, feedback}]
+
+
+# Keep old name as alias so pipeline.py still works without changes
+SessionState = SessionContext
 
 
 def _print_llm_probe(cfg: AppConfig) -> None:
@@ -58,8 +86,96 @@ def _prompt_symbol() -> str:
         return ""
 
     # Accept either a bare identifier or a sentence containing one.
-    m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", follow)
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)", follow)
     return m.group(1) if m else ""
+
+
+
+def _refine_plan(cfg: AppConfig, symbol: str, steps: list[str], history: list[dict] | None = None) -> list[str]:
+    """Enter an interactive refine loop for the plan. Returns the (possibly updated) steps."""
+    while True:
+        feedback = prompt_text(
+            "请描述修改意见（直接回车接受，输入 /skip 跳过本次迁移）：\n> "
+        ).strip()
+        if not feedback:
+            return steps
+        if feedback.lower() in {"/skip", "/cancel"}:
+            return []  # empty → caller should cancel
+        from .llm import LlmMessage, chat_completion
+        from .prompts import plan_refine_prompt, system_prompt
+        try:
+            raw = chat_completion(
+                cfg.llm,
+                [
+                    LlmMessage(role="system", content=system_prompt()),
+                    LlmMessage(role="user", content=plan_refine_prompt(symbol, steps, feedback)),
+                ],
+                max_tokens=600,
+            )
+            raw = raw.strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end > start:
+                import json
+                data = json.loads(raw[start : end + 1])
+                new_steps = [str(s).strip() for s in data.get("steps", []) if str(s).strip()]
+                if new_steps:
+                    steps = new_steps
+                    if history is not None:
+                        history.append({"stage": "plan", "feedback": feedback})
+        except Exception as e:
+            print(f"（LLM refine 失败：{e}，保留当前计划）")
+
+        print("\n修改后的 Plan：")
+        for i, s in enumerate(steps, 1):
+            print(f"{i:02d}. {s}")
+        if prompt_yes_no("\n确认这份计划？", default=True):
+            return steps
+
+
+def _refine_files(cfg: AppConfig, symbol: str, files: list[str], history: list[dict] | None = None) -> list[str]:
+    """Enter an interactive refine loop for the reference file list. Returns updated list."""
+    while True:
+        feedback = prompt_text(
+            "请描述修改意见（直接回车接受，输入 /skip 跳过本次迁移）：\n> "
+        ).strip()
+        if not feedback:
+            return files
+        if feedback.lower() in {"/skip", "/cancel"}:
+            return []
+        from .llm import LlmMessage, chat_completion
+        from .prompts import files_refine_prompt, system_prompt
+        import json
+        try:
+            raw = chat_completion(
+                cfg.llm,
+                [
+                    LlmMessage(role="system", content=system_prompt()),
+                    LlmMessage(role="user", content=files_refine_prompt(symbol, files, feedback)),
+                ],
+                max_tokens=600,
+            )
+            raw = raw.strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end > start:
+                data = json.loads(raw[start : end + 1])
+                new_files: list[str] = []
+                for k in ("c", "x86", "arm", "riscv", "headers", "makefiles", "checkasm"):
+                    v = data.get(k, [])
+                    if isinstance(v, list):
+                        new_files.extend(str(x) for x in v)
+                new_files = list(dict.fromkeys(new_files))
+                if new_files:
+                    files = new_files
+                    if history is not None:
+                        history.append({"stage": "files", "feedback": feedback})
+        except Exception as e:
+            print(f"（LLM refine 失败：{e}，保留当前文件列表）")
+
+        print("\n修改后的参考文件：")
+        for f in files:
+            print(f"  - {f}")
+        if prompt_yes_no("\n确认这份文件列表？", default=True):
+            return files
 
 
 def run_chat(cfg: AppConfig) -> int:
@@ -118,26 +234,55 @@ def run_chat(cfg: AppConfig) -> int:
                 print("已取消或未提供有效 symbol，本轮结束。\n")
                 continue
 
-        plan = fixed_plan(symbol)
-        print("\nPlan：")
-        for i, s in enumerate(plan.steps, start=1):
-            print(f"{i:02d}. {s}")
-
-        if not prompt_yes_no("\n确认按该 plan 继续？", default=True):
-            print("已取消，本轮结束。\n")
-            continue
-
+        # Create run directory and record user input first (must be before any usage of run_dir)
         run_dir = Path("runs") / f"{now_id()}_{slug(symbol)}"
         ensure_dir(run_dir)
+        _user_input_lines = [user_text]
         write_text(run_dir / "user_input.txt", user_text + "\n")
         write_text(run_dir / "intent_raw.txt", intent.raw + "\n")
+
+        # Use cached plan for this symbol if already refined in this session
+        if symbol in state.plans:
+            plan_steps = state.plans[symbol]
+            print("\n（使用本次会话中已确认的计划）")
+        else:
+            print("\n正在生成迁移计划…")
+            _p = llm_plan(cfg, symbol)
+            plan_steps = _p.steps
+
+        # Display concise fixed 8-step summary; LLM-generated detail stays internal
+        _DISPLAY_STEPS = [
+            f"意图解析：迁移 {symbol}",
+            "定位 C 实现",
+            "定位 x86 / ARM 参考实现",
+            "语义抽象（结构化任务描述 JSON）",
+            "（MVP）调用 LLM 生成 RVV asm + init + Makefile patch（先落到 runs/）",
+            "（可选）把补丁应用到 workspace",
+            "（可选）交叉 configure + build checkasm",
+            "生成 run 报告（轨迹、输入输出、命令、摘要）",
+        ]
+        print("\nPlan：")
+        for i, s in enumerate(_DISPLAY_STEPS, start=1):
+            print(f"  {i}. {s}")
+
+        if not prompt_yes_no("\n确认按该 plan 继续？", default=True):
+            plan_steps = _refine_plan(cfg, symbol, plan_steps, history=state.refine_history)
+            if not plan_steps:
+                print("已取消，本轮结束。\n")
+                continue
+            _user_input_lines.append("[plan-refined]")
+        state.plans[symbol] = plan_steps
+        # Update user_input log with any refine feedback
+        write_text(run_dir / 'user_input.txt', '\n'.join(_user_input_lines) + '\n')
+        from .plan import Plan as _Plan
+        plan = _Plan(steps=plan_steps)
 
         ffmpeg_root = cfg.ffmpeg.root.expanduser().resolve()
         if not ffmpeg_root.exists():
             print(f"ffmpeg_root 不存在：{ffmpeg_root}")
             continue
 
-        retrieval = select_references(cfg, ffmpeg_root, symbol)
+        retrieval = select_references(cfg, ffmpeg_root, intent)
         write_text(run_dir / "retrieval_raw.txt", retrieval.raw_text + "\n")
         selected = retrieval.selected
 
@@ -154,15 +299,37 @@ def run_chat(cfg: AppConfig) -> int:
         for p in selected_files:
             print(f"- {p}")
 
+        # Use cached file list for this symbol if already refined
+        if symbol in state.ref_files:
+            selected_files = state.ref_files[symbol]
+            print("\n（使用本次会话中已确认的参考文件列表）")
+            print("\n参考文件：")
+            for _f in selected_files:
+                print(f"  - {_f}")
+
         if not prompt_yes_no("\n确认进入分析/生成阶段？", default=True):
-            print("已取消，本轮结束。\n")
-            continue
+            selected_files = _refine_files(cfg, symbol, selected_files, history=state.refine_history)
+            if not selected_files:
+                print("已取消，本轮结束。\n")
+                continue
+        state.ref_files[symbol] = selected_files
+        # Persist final selected files back to retrieval_raw
+        import json as _json
+        write_text(run_dir / 'retrieval_raw.txt',
+                   retrieval.raw_text + '\n\n# FINAL SELECTED:\n' +
+                   _json.dumps(selected_files, ensure_ascii=False, indent=2) + '\n')
 
         ctx = build_context_from_files(ffmpeg_root, symbol=symbol, files=selected_files)
         write_text(run_dir / "context.txt", ctx)
 
         analysis = analyze_with_llm(cfg, retrieval.discovery, context_override=ctx)
-        gen = generate_with_llm(cfg, symbol, analysis.analysis)
+        existing_map = scan_existing_rvv_content(ffmpeg_root, selected_files)
+        if existing_map:
+            print(f"\n检测到以下 RVV 文件已存在（将增量生成）：")
+            for _ep in existing_map:
+                print(f"  - {_ep}")
+        gen = generate_with_llm(cfg, symbol, analysis.analysis,
+                               existing_files_map=existing_map or None)
 
         if state.apply_ok is None:
             state.apply_ok = prompt_yes_no(
@@ -170,11 +337,12 @@ def run_chat(cfg: AppConfig) -> int:
                 default=False,
             )
 
+        # materialize to runs/ for traceability (no apply yet; apply happens inside build retry loop)
         materialized = materialize_package(
             run_dir,
             ffmpeg_root,
             gen.package,
-            apply=bool(state.apply_ok),
+            apply=False,
         )
 
         exec_result = ExecResult()
@@ -194,14 +362,38 @@ def run_chat(cfg: AppConfig) -> int:
                 default=False,
             )
 
+        MAX_BUILD_RETRIES = 3
+        build_attempt = 0
         if state.build_ok:
             import os
-
             jobs = max(1, os.cpu_count() or 1)
             build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
             ensure_dir(build_dir)
             exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
-            exec_result.make_checkasm = run_make_checkasm(build_dir, jobs)
+
+            while build_attempt < MAX_BUILD_RETRIES:
+                materialize_package(run_dir, ffmpeg_root, gen.package,
+                                    apply=True, attempt=build_attempt)
+                exec_result.make_checkasm = run_make_checkasm(build_dir, jobs)
+                if exec_result.make_checkasm.returncode == 0:
+                    print(f"\n构建成功（第 {build_attempt+1} 次尝试）")
+                    break
+                # Build failed
+                build_attempt += 1
+                err_text = (exec_result.make_checkasm.stdout +
+                            exec_result.make_checkasm.stderr)[:4000]
+                if build_attempt >= MAX_BUILD_RETRIES:
+                    print(f"\n构建连续失败 {MAX_BUILD_RETRIES} 次，请人工处理。")
+                    print(f"错误信息片段：\n{err_text[:800]}\n")
+                    break
+                print(f"\n构建失败（第 {build_attempt} 次尝试），正在让 LLM 修复…")
+                fix_result = fix_generation_with_llm(cfg, symbol, err_text, gen.package)
+                if fix_result.error:
+                    print(f"LLM 修复请求失败：{fix_result.error}")
+                    break
+                gen = fix_result
+                write_text(run_dir / f"fix_attempt{build_attempt}_raw.txt",
+                           gen.raw_text)
 
         # Board steps
         if cfg.board.enabled:
@@ -264,6 +456,8 @@ def run_chat(cfg: AppConfig) -> int:
             generation_raw=gen.raw_text,
             materialized=materialized,
             exec_result=exec_result,
+            ref_files=selected_files,
+            refine_history=state.refine_history if state.refine_history else None,
             interaction={
                 "intent_action": intent.action,
                 "intent_llm_used": intent.llm_used,
@@ -272,6 +466,7 @@ def run_chat(cfg: AppConfig) -> int:
                 "retrieval_error": retrieval.error,
                 "apply_ok": state.apply_ok,
                 "build_ok": state.build_ok,
+                "build_attempts": build_attempt + 1,
                 "scp_ok": state.scp_ok,
                 "run_on_board_ok": state.run_on_board_ok,
                 "board_enabled": cfg.board.enabled,

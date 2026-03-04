@@ -17,6 +17,30 @@ class Intent:
     llm_used: bool
     error: str | None = None
 
+    @property
+    def module(self) -> str:
+        """For dotted symbols like 'sbrdsp.neg_odd_64' returns 'sbrdsp'; otherwise same as symbol."""
+        if "." in self.symbol:
+            return self.symbol.split(".")[0]
+        return self.symbol
+
+    @property
+    def func_name(self) -> str:
+        """For dotted symbols like 'sbrdsp.neg_odd_64' returns 'neg_odd_64'; otherwise same as symbol."""
+        if "." in self.symbol:
+            return self.symbol.split(".", 1)[1]
+        return self.symbol
+
+    @property
+    def search_terms(self) -> list[str]:
+        """All terms worth searching for in the FFmpeg tree.
+        For 'sbrdsp.neg_odd_64' returns ['neg_odd_64', 'sbrdsp', 'sbrdsp.neg_odd_64']
+        so that both the C function and the module source file are found.
+        """
+        if "." in self.symbol:
+            return [self.func_name, self.module, self.symbol]
+        return [self.symbol]
+
 
 def _extract_json(raw: str) -> dict:
     raw = raw.strip()
@@ -30,29 +54,50 @@ def _extract_json(raw: str) -> dict:
 
 
 def _extract_symbol_heuristic(user_text: str) -> str:
-    # 1) explicit patterns: 函数/算子/符号: xxx
+    # A "dotted C symbol": identifier segments separated by dots,
+    # e.g. sbrdsp.neg_odd_64 or plain names like ff_vp8_idct16_add.
+    _DOT_IDENT = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+
+    # 1) Explicit keyword patterns: 算子/函数/符号/symbol/... followed by the name.
     m = re.search(
-        r"(?:\b(symbol|operator|kernel|function)\b|算子|函数|符号)\s*[:：]?\s*`?([A-Za-z_][A-Za-z0-9_]*)`?",
+        r"(?:\b(?:symbol|operator|kernel|function)\b|算子|函数|符号)"
+        r"\s*[:：]?\s*`?(" + _DOT_IDENT + r")`?",
         user_text,
         flags=re.IGNORECASE,
     )
     if m:
-        return m.group(2)
+        return m.group(1)
 
-    # 2) common ff_* shortcut
-    m = re.search(r"\b(ff_[A-Za-z0-9_]+)\b", user_text)
+    # 2) Common ff_* shortcut (may also have dots).
+    m = re.search(r"\b(ff_[A-Za-z0-9_.]+)\b", user_text)
     if m:
         return m.group(1)
 
-    # 3) if input is a single identifier token and looks like a C symbol
+    # 3) Migrate-verb + dotted-name pattern: "迁移 sbrdsp.neg_odd_64 到/的/..."
+    m = re.search(
+        r"(?:迁移|移植|migrate|port)\s+(" + _DOT_IDENT + r")(?:\s|$|到|的|为|至)",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    # 3b) Reversed: "sbrdsp.neg_odd_64 算子" – dotted name followed by keyword.
+    m = re.search(
+        r"(" + _DOT_IDENT + r")\s*(?:算子|函数|符号|\boperator\b|\bfunction\b|\bkernel\b)",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    # 4) Single token – lone identifier / dotted-name.
     t = user_text.strip()
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t):
-        # bias toward function-like names
-        if "_" in t or len(t) >= 8:
+    if re.fullmatch(_DOT_IDENT, t):
+        if "_" in t or "." in t or len(t) >= 8:
             return t
 
     return ""
-
 
 def _has_ffmpeg_context(user_text: str) -> bool:
     t = user_text.lower()
