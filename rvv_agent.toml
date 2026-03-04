@@ -2,7 +2,6 @@
 root = "workplace/FFmpeg"
 build_dir = "build"
 # 默认使用 workspace 内的 configure：<ffmpeg_root>/configure
-# 如果你确实要用另一棵源码树的 configure，再打开这一行
 # configure_path = "/home/yuhe/project/original/FFmpeg/configure"
 configure_extra_args = []
 
@@ -19,3 +18,11 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "LLM_API_KEY"
 model = "gpt-5.2-mini"
 temperature = 0.2
+
+[board]
+# 先保持 false；填好 user/host/remote_dir 后再打开
+enabled = false
+user = "musepi"
+host = "192.168.31.124"
+port = 22
+remote_dir = "workplace"

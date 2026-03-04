@@ -1,32 +1,88 @@
 from __future__ import annotations
 
+import json
+
 
 def system_prompt() -> str:
     return (
         "你是一个面向 FFmpeg 的 RISC-V Vector (RVV) SIMD 迁移助手。"
         "你输出必须工程化、可执行、可落盘。"
+        "在涉及修改代码、编译、scp、远程运行前，必须让人类确认。"
     )
+
+
+def intent_prompt(user_text: str) -> str:
+    return f"""你将解析用户意图，并输出严格 JSON（不要额外文字）。
+
+用户输入：{user_text}
+
+输出 JSON schema：
+{{
+  \"action\": \"migrate\",
+  \"symbol\": \"ff_xxx\",
+  \"notes\": \"...\"
+}}
+
+要求：
+- 如果用户给了明确的函数名（比如 ff_vp8_idct16_add），symbol 必须直接使用它。
+- action 当前只允许 migrate。
+"""
+
+
+def retrieval_prompt(symbol: str, grouped: dict, matches: list) -> str:
+    # Keep payload small.
+    grouped_s = json.dumps(grouped, ensure_ascii=False)
+    matches_s = "\n".join(str(m) for m in matches)
+
+    return f"""你将根据检索分组结果，选择最相关的参考文件列表，并输出严格 JSON（不要额外文字）。
+
+目标 symbol：{symbol}
+
+候选分组（文件路径列表，JSON）：
+{grouped_s}
+
+部分命中行：
+{matches_s}
+
+输出 JSON schema：
+{{
+  \"symbol\": \"{symbol}\",
+  \"c\": [\"...\"],
+  \"x86\": [\"...\"],
+  \"arm\": [\"...\"],
+  \"riscv\": [\"...\"],
+  \"headers\": [\"...\"],
+  \"makefiles\": [\"...\"],
+  \"checkasm\": [\"...\"],
+  \"notes\": \"...\"
+}}
+
+要求：
+- 每个列表最多 5 个文件。
+- makefiles 至少包含 libavcodec/riscv/Makefile（如果不存在也照写）。
+- checkasm 建议给出 tests/checkasm/checkasm.c（若无法确定可留空数组）。
+"""
 
 
 def analysis_prompt(symbol: str, context: str) -> str:
     return f"""任务：迁移/生成 {symbol} 的 RVV 优化。
 
-请基于下面的上下文（来自 workspace 的源码检索片段）输出一个严格 JSON（不要额外文字），字段如下：
+请基于下面的上下文（来自 workspace 的源码片段）输出一个严格 JSON（不要额外文字），字段如下：
 
 {{
-  "symbol": "{symbol}",
-  "datatype": "unknown|int16|int32|uint8|...",
-  "vectorizable": true|false,
-  "pattern": ["butterfly", "horizontal_add", "stride_load", "saturate", "tail"],
-  "has_stride": true|false,
-  "has_saturation": true|false,
-  "reduction": true|false,
-  "tail_required": true|false,
-  "math_expression": "...",
-  "c_candidates": ["path:line", ...],
-  "x86_refs": ["path:line", ...],
-  "arm_refs": ["path:line", ...],
-  "notes": "..."
+  \"symbol\": \"{symbol}\",
+  \"datatype\": \"unknown|int16|int32|uint8|...\",
+  \"vectorizable\": true|false,
+  \"pattern\": [\"butterfly\", \"horizontal_add\", \"stride_load\", \"saturate\", \"tail\"],
+  \"has_stride\": true|false,
+  \"has_saturation\": true|false,
+  \"reduction\": true|false,
+  \"tail_required\": true|false,
+  \"math_expression\": \"...\",
+  \"c_candidates\": [\"path:line\", ...],
+  \"x86_refs\": [\"path:line\", ...],
+  \"arm_refs\": [\"path:line\", ...],
+  \"notes\": \"...\"
 }}
 
 上下文：
@@ -45,8 +101,8 @@ def generation_prompt(symbol: str, analysis_json: str) -> str:
 
 输出格式必须是严格 JSON（不要额外文字）：
 {{
-  "files": [{{"path": "...", "content": "..."}}, ...],
-  "patches": [{{"path": "...", "diff": "..."}}, ...]
+  \"files\": [{{\"path\": \"...\", \"content\": \"...\"}}, ...],
+  \"patches\": [{{\"path\": \"...\", \"diff\": \"...\"}}, ...]
 }}
 
 analysis_json:

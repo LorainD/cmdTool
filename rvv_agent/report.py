@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .analyze import AnalysisResult
@@ -16,15 +17,14 @@ def _cmd_section(title: str, res: CmdResult | None) -> str:
     out = res.stdout.strip()
     err = res.stderr.strip()
 
-    s = [
-        f"## {title}\n",
-        "```\n" + "$ " + fmt_argv(res.argv) + f"\n(rc={res.returncode})\n" + "```\n",
-    ]
+    parts: list[str] = []
+    parts.append(f"## {title}\n")
+    parts.append("```\n" + "$ " + fmt_argv(res.argv) + f"\n(rc={res.returncode})\n" + "```\n")
     if out:
-        s.append("### stdout\n\n```\n" + out[:20000] + "\n```\n")
+        parts.append("### stdout\n\n```\n" + out[:20000] + "\n```\n")
     if err:
-        s.append("### stderr\n\n```\n" + err[:20000] + "\n```\n")
-    return "\n".join(s)
+        parts.append("### stderr\n\n```\n" + err[:20000] + "\n```\n")
+    return "\n".join(parts)
 
 
 def write_report(
@@ -36,16 +36,20 @@ def write_report(
     generation_raw: str,
     materialized: list[Path],
     exec_result: ExecResult,
+    interaction: dict | None = None,
 ) -> Path:
     ensure_dir(run_dir)
 
     groups = group_files(discovery)
 
     md: list[str] = []
-    md.append(f"# rvv-agent run report\n")
+    md.append("# rvv-agent run report\n")
     md.append("## Symbol\n\n" + f"- {discovery.symbol}\n")
 
     md.append("## Plan\n\n" + "\n".join(f"- {s}" for s in plan.steps) + "\n")
+
+    if interaction:
+        md.append("## Interaction\n\n```json\n" + json.dumps(interaction, ensure_ascii=False, indent=2) + "\n```\n")
 
     md.append("## Discovery\n")
     for k, v in groups.items():
@@ -58,7 +62,7 @@ def write_report(
         md.append(f"- {m.file}:{m.line}: {m.text}")
 
     md.append("\n## Analysis JSON\n")
-    md.append("```json\n" + __import__("json").dumps(analysis.analysis, ensure_ascii=False, indent=2) + "\n```\n")
+    md.append("```json\n" + json.dumps(analysis.analysis, ensure_ascii=False, indent=2) + "\n```\n")
     md.append(f"- llm_used: {analysis.llm_used}\n")
     if analysis.error:
         md.append(f"- error: {analysis.error}\n")
@@ -76,7 +80,6 @@ def write_report(
     report_path = run_dir / "report.md"
     write_text(report_path, "\n".join(md))
 
-    # raw json outputs
     write_json(run_dir / "discovery.json", {"symbol": discovery.symbol, "matches": [m.__dict__ for m in discovery.matches]})
     write_json(run_dir / "analysis.json", analysis.analysis)
 

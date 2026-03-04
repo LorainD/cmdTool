@@ -13,12 +13,12 @@ class ExecResult:
     make_checkasm: CmdResult | None = None
 
 
-def run_configure(cfg: AppConfig, ffmpeg_root: Path, build_dir: Path) -> CmdResult:
+def configure_argv(cfg: AppConfig, ffmpeg_root: Path) -> list[str]:
     configure = cfg.ffmpeg.configure_path
     if configure is None:
         configure = ffmpeg_root / "configure"
 
-    argv = [
+    return [
         str(configure),
         f"--cross-prefix={cfg.toolchain.cross_prefix}",
         f"--arch={cfg.toolchain.arch}",
@@ -31,9 +31,15 @@ def run_configure(cfg: AppConfig, ffmpeg_root: Path, build_dir: Path) -> CmdResu
         "--enable-static",
         *cfg.ffmpeg.configure_extra_args,
     ]
-    return run_cmd(argv, cwd=build_dir)
+
+
+def make_checkasm_argv(jobs: int) -> list[str]:
+    return ["make", f"-j{jobs}", "tests/checkasm/checkasm"]
+
+
+def run_configure(cfg: AppConfig, ffmpeg_root: Path, build_dir: Path) -> CmdResult:
+    return run_cmd(configure_argv(cfg, ffmpeg_root), cwd=build_dir)
 
 
 def run_make_checkasm(build_dir: Path, jobs: int) -> CmdResult:
-    argv = ["make", f"-j{jobs}", "tests/checkasm/checkasm"]
-    return run_cmd(argv, cwd=build_dir)
+    return run_cmd(make_checkasm_argv(jobs), cwd=build_dir)

@@ -47,6 +47,14 @@
 ./bin/rvv-agent migrate ff_vp8_idct16_add --exec
 ```
 
+- 交互式对话入口（推荐）：每一步都会提示确认（plan / 写库 / 编译 / scp / 板端运行）
+
+```bash
+./bin/rvv-agent chat
+```
+
+- （可选）开启 scp/板端运行：编辑 `rvv_agent.toml` 的 `[board]`，填好 `user/host/remote_dir`，然后把 `enabled=true`。
+
 产物：
 - `runs/<timestamp>_<symbol>/report.md`
 - `runs/<timestamp>_<symbol>/analysis.json`

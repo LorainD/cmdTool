@@ -36,8 +36,13 @@ def _fallback_analysis(discovery: Discovery) -> dict:
     }
 
 
-def analyze_with_llm(cfg: AppConfig, discovery: Discovery) -> AnalysisResult:
-    ctx = build_llm_context(discovery)
+def analyze_with_llm(
+    cfg: AppConfig,
+    discovery: Discovery,
+    *,
+    context_override: str | None = None,
+) -> AnalysisResult:
+    ctx = context_override if context_override is not None else build_llm_context(discovery)
     messages = [
         LlmMessage(role="system", content=system_prompt()),
         LlmMessage(role="user", content=analysis_prompt(discovery.symbol, ctx)),

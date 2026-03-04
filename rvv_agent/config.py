@@ -33,10 +33,20 @@ class FfmpegConfig:
 
 
 @dataclass
+class BoardConfig:
+    enabled: bool = False
+    user: str = ""
+    host: str = ""
+    port: int = 22
+    remote_dir: str = "workplace"
+
+
+@dataclass
 class AppConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     toolchain: ToolchainConfig = field(default_factory=ToolchainConfig)
     ffmpeg: FfmpegConfig = field(default_factory=FfmpegConfig)
+    board: BoardConfig = field(default_factory=BoardConfig)
 
 
 def _as_path(v: object) -> Path | None:
@@ -76,7 +86,13 @@ def load_config(path: Path | None) -> AppConfig:
         cfg.ffmpeg.configure_path = _as_path(ff.get("configure_path"))
         cfg.ffmpeg.configure_extra_args = list(ff.get("configure_extra_args", cfg.ffmpeg.configure_extra_args))
 
-    # env override
+        bd = raw.get("board", {})
+        cfg.board.enabled = bool(bd.get("enabled", cfg.board.enabled))
+        cfg.board.user = str(bd.get("user", cfg.board.user))
+        cfg.board.host = str(bd.get("host", cfg.board.host))
+        cfg.board.port = int(bd.get("port", cfg.board.port))
+        cfg.board.remote_dir = str(bd.get("remote_dir", cfg.board.remote_dir))
+
     if os.getenv("RVV_AGENT_FFMPEG_ROOT"):
         cfg.ffmpeg.root = Path(os.environ["RVV_AGENT_FFMPEG_ROOT"])
 

@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import AppConfig
+from .llm import LlmError, LlmMessage, chat_completion
+from .prompts import retrieval_prompt, system_prompt
+from .search import Discovery, find_symbol, group_files
+
+
+@dataclass
+class RetrievalResult:
+    discovery: Discovery
+    selected: dict
+    raw_text: str
+    llm_used: bool
+    error: str | None = None
+
+
+def _extract_json(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("{") and raw.endswith("}"):
+        return json.loads(raw)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(raw[start : end + 1])
+    return json.loads(raw)
+
+
+def _fallback_selection(discovery: Discovery) -> dict:
+    g = group_files(discovery)
+    # Always include riscv Makefile if exists (helps patch)
+    makefiles = []
+    if any(m.file.startswith("libavcodec/riscv/") for m in discovery.matches):
+        makefiles.append("libavcodec/riscv/Makefile")
+    else:
+        makefiles.append("libavcodec/riscv/Makefile")
+
+    return {
+        "symbol": discovery.symbol,
+        "c": g["c_candidates"][:5],
+        "x86": g["x86_refs"][:5],
+        "arm": g["arm_refs"][:5] + g["aarch64_refs"][:5],
+        "riscv": g["riscv_refs"][:5],
+        "headers": g["headers"][:5],
+        "makefiles": makefiles,
+        "checkasm": ["tests/checkasm/checkasm.c"],
+        "notes": "LLM 未运行或解析失败，使用 fallback 选择。",
+    }
+
+
+def select_references(cfg: AppConfig, ffmpeg_root: Path, symbol: str) -> RetrievalResult:
+    discovery = find_symbol(ffmpeg_root, symbol)
+    grouped = group_files(discovery)
+
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=retrieval_prompt(symbol, grouped, discovery.matches[:120])),
+    ]
+
+    try:
+        raw = chat_completion(cfg.llm, messages, max_tokens=900)
+        data = _extract_json(raw)
+        if not isinstance(data, dict):
+            raise ValueError("retrieval json is not object")
+        return RetrievalResult(discovery=discovery, selected=data, raw_text=raw, llm_used=True)
+    except LlmError as e:
+        fb = _fallback_selection(discovery)
+        return RetrievalResult(discovery=discovery, selected=fb, raw_text=str(e), llm_used=False, error=str(e))
+    except Exception as e:
+        fb = _fallback_selection(discovery)
+        return RetrievalResult(discovery=discovery, selected=fb, raw_text=repr(e), llm_used=False, error=repr(e))
