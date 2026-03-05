@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import LlmConfig
@@ -19,6 +21,150 @@ class LlmMessage:
 class LlmError(RuntimeError):
     pass
 
+
+# ---------------------------------------------------------------------------
+# Per-session trajectory (reset before each pipeline run, saved by caller)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrajectoryEvent:
+    timestamp: str
+    stage: str
+    prompt: str           # last user message
+    response: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+    cumulative_input_tokens: int
+    cumulative_output_tokens: int
+    cumulative_cost_usd: float
+    elapsed_seconds: float
+
+    def to_dict(self) -> dict:
+        return {
+            "timestamp": self.timestamp,
+            "stage": self.stage,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": round(self.cost_usd, 8),
+            "cumulative_input_tokens": self.cumulative_input_tokens,
+            "cumulative_output_tokens": self.cumulative_output_tokens,
+            "cumulative_cost_usd": round(self.cumulative_cost_usd, 8),
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "prompt": self.prompt[:2000],
+            "response": self.response[:4000],
+        }
+
+
+class _Trajectory:
+    def __init__(self) -> None:
+        self._events: list[TrajectoryEvent] = []
+        self._cum_in = 0
+        self._cum_out = 0
+        self._cum_cost = 0.0
+
+    def reset(self) -> None:
+        self._events = []
+        self._cum_in = 0
+        self._cum_out = 0
+        self._cum_cost = 0.0
+
+    def record(
+        self,
+        stage: str,
+        prompt: str,
+        response: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_per_1m_in: float,
+        cost_per_1m_out: float,
+        elapsed: float,
+    ) -> None:
+        cost = (input_tokens * cost_per_1m_in + output_tokens * cost_per_1m_out) / 1_000_000
+        self._cum_in += input_tokens
+        self._cum_out += output_tokens
+        self._cum_cost += cost
+        evt = TrajectoryEvent(
+            timestamp=dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            stage=stage,
+            prompt=prompt,
+            response=response,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cost_usd=cost,
+            cumulative_input_tokens=self._cum_in,
+            cumulative_output_tokens=self._cum_out,
+            cumulative_cost_usd=self._cum_cost,
+            elapsed_seconds=elapsed,
+        )
+        self._events.append(evt)
+
+    def to_dict(self, model: str = "", endpoint: str = "") -> dict:
+        return {
+            "model": model,
+            "endpoint": endpoint,
+            "events": [e.to_dict() for e in self._events],
+            "totals": {
+                "input_tokens": self._cum_in,
+                "output_tokens": self._cum_out,
+                "total_tokens": self._cum_in + self._cum_out,
+                "cost_usd": round(self._cum_cost, 8),
+                "num_calls": len(self._events),
+            },
+        }
+
+    def __len__(self) -> int:
+        return len(self._events)
+
+
+# Module-level singleton – one per process
+_TRAJECTORY = _Trajectory()
+
+
+def reset_trajectory() -> None:
+    """Reset trajectory at the start of a new pipeline run."""
+    _TRAJECTORY.reset()
+
+
+def get_trajectory_dict(model: str = "", endpoint: str = "") -> dict:
+    return _TRAJECTORY.to_dict(model=model, endpoint=endpoint)
+
+
+# ---------------------------------------------------------------------------
+# Pricing helpers – sensible defaults for common models
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PRICING: dict[str, tuple[float, float]] = {
+    # model-name-prefix → ($/1M input, $/1M output)
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (5.0, 15.0),
+    "gpt-4-turbo": (10.0, 30.0),
+    "gpt-4": (30.0, 60.0),
+    "gpt-3.5-turbo": (0.5, 1.5),
+    "claude-3-5-sonnet": (3.0, 15.0),
+    "claude-3-5-haiku": (0.8, 4.0),
+    "claude-3-opus": (15.0, 75.0),
+    "deepseek-chat": (0.14, 0.28),
+}
+
+
+def _pricing_for_model(cfg: LlmConfig) -> tuple[float, float]:
+    # Allow override in config
+    if hasattr(cfg, "cost_per_1m_input_tokens") and cfg.cost_per_1m_input_tokens > 0:
+        return cfg.cost_per_1m_input_tokens, cfg.cost_per_1m_output_tokens
+    m = cfg.model.lower()
+    for prefix, price in _DEFAULT_PRICING.items():
+        if m.startswith(prefix):
+            return price
+    return 0.0, 0.0  # unknown model – no cost estimate
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
 
 def _headers(api_key: str) -> dict[str, str]:
     return {
@@ -45,8 +191,6 @@ def _endpoint_url(cfg: LlmConfig) -> str:
     url = (cfg.base_url or "").strip().rstrip("/")
     if not url:
         raise LlmError("Missing LLM endpoint URL: set llm.base_url in rvv_agent.toml")
-    # Auto-append the chat completions path when only a base URL is given,
-    # e.g. "https://api.openai.com/v1"  →  ".../v1/chat/completions"
     if not url.endswith("/chat/completions"):
         url = url + "/chat/completions"
     return url
@@ -58,7 +202,13 @@ def chat_completion(
     *,
     max_tokens: int = 2048,
     timeout_seconds: float = 120.0,
+    stage: str = "llm",
 ) -> str:
+    """Call the LLM and return the assistant text.
+
+    Also appends a :class:`TrajectoryEvent` to the module-level trajectory so
+    callers can save it to ``trajectory.json`` with :func:`get_trajectory_dict`.
+    """
     api_key = os.getenv(cfg.api_key_env, "").strip()
     if not api_key:
         raise LlmError(f"Missing API key: env {cfg.api_key_env} is empty")
@@ -79,24 +229,88 @@ def chat_completion(
         method="POST",
     )
 
+    # Build prompt string for trajectory (last user message) – needed even on failure
+    prompt_text = ""
+    for m in reversed(messages):
+        if m.role == "user":
+            prompt_text = m.content
+            break
+
+    price_in, price_out = _pricing_for_model(cfg)
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
+        elapsed = time.monotonic() - t0
         body = ""
         try:
             body = e.read().decode("utf-8", errors="replace")  # type: ignore[attr-defined]
         except Exception:
             body = ""
-        raise LlmError(f"HTTP {e.code} from {url}: {body[:2000]}") from e
+        err_msg = f"HTTP {e.code} from {url}: {body[:2000]}"
+        _TRAJECTORY.record(
+            stage=stage + "_error",
+            prompt=prompt_text,
+            response=f"ERROR: {err_msg}",
+            input_tokens=0,
+            output_tokens=0,
+            cost_per_1m_in=price_in,
+            cost_per_1m_out=price_out,
+            elapsed=elapsed,
+        )
+        raise LlmError(err_msg) from e
     except Exception as e:
-        raise LlmError(f"LLM request failed at {url}: {e}") from e
+        elapsed = time.monotonic() - t0
+        err_msg = f"LLM request failed at {url}: {e}"
+        _TRAJECTORY.record(
+            stage=stage + "_error",
+            prompt=prompt_text,
+            response=f"ERROR: {err_msg}",
+            input_tokens=0,
+            output_tokens=0,
+            cost_per_1m_in=price_in,
+            cost_per_1m_out=price_out,
+            elapsed=elapsed,
+        )
+        raise LlmError(err_msg) from e
+
+    elapsed = time.monotonic() - t0
 
     try:
         data = json.loads(raw)
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except Exception as e:
-        raise LlmError(f"Unexpected LLM response: {raw[:2000]}") from e
+        err_msg = f"Unexpected LLM response: {raw[:2000]}"
+        _TRAJECTORY.record(
+            stage=stage + "_parse_error",
+            prompt=prompt_text,
+            response=f"ERROR: {err_msg}",
+            input_tokens=0,
+            output_tokens=0,
+            cost_per_1m_in=price_in,
+            cost_per_1m_out=price_out,
+            elapsed=elapsed,
+        )
+        raise LlmError(err_msg) from e
+
+    # Parse usage from response
+    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+    input_tokens = int(usage.get("prompt_tokens", 0))
+    output_tokens = int(usage.get("completion_tokens", 0))
+
+    _TRAJECTORY.record(
+        stage=stage,
+        prompt=prompt_text,
+        response=content,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_per_1m_in=price_in,
+        cost_per_1m_out=price_out,
+        elapsed=elapsed,
+    )
+
+    return content
 
 
 def probe_llm(cfg: LlmConfig) -> dict[str, object]:
@@ -119,6 +333,7 @@ def probe_llm(cfg: LlmConfig) -> dict[str, object]:
             ],
             max_tokens=8,
             timeout_seconds=probe_timeout,
+            stage="probe",
         )
         status["probe_ok"] = True
         status["probe_reply"] = text.strip()[:200]

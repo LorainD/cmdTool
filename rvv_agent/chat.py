@@ -23,7 +23,7 @@ from .generate import (
 )
 from .intent import parse_intent
 from .interactive import prompt_secret, prompt_text, prompt_yes_no
-from .llm import LlmMessage, chat_completion, probe_llm
+from .llm import LlmMessage, chat_completion, probe_llm, reset_trajectory, get_trajectory_dict
 from .plan import fixed_plan, llm_plan
 from .prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
@@ -217,7 +217,7 @@ def run_chat(cfg: AppConfig) -> int:
                 history = [history[0], *history[-16:]]
 
             try:
-                reply = chat_completion(cfg.llm, history, max_tokens=800).strip()
+                reply = chat_completion(cfg.llm, history, max_tokens=800, stage="chat").strip()
                 print(reply + "\n")
                 history.append(LlmMessage(role="assistant", content=reply))
             except Exception as e:
@@ -241,12 +241,15 @@ def run_chat(cfg: AppConfig) -> int:
         write_text(run_dir / "user_input.txt", user_text + "\n")
         write_text(run_dir / "intent_raw.txt", intent.raw + "\n")
 
+        # Reset LLM trajectory for this pipeline run
+        reset_trajectory()
+
         # Use cached plan for this symbol if already refined in this session
         if symbol in state.plans:
             plan_steps = state.plans[symbol]
             print("\n（使用本次会话中已确认的计划）")
         else:
-            print("\n正在生成迁移计划…")
+            print("\n📖正在生成迁移计划…")
             _p = llm_plan(cfg, symbol)
             plan_steps = _p.steps
 
@@ -268,7 +271,7 @@ def run_chat(cfg: AppConfig) -> int:
         if not prompt_yes_no("\n确认按该 plan 继续？", default=True):
             plan_steps = _refine_plan(cfg, symbol, plan_steps, history=state.refine_history)
             if not plan_steps:
-                print("已取消，本轮结束。\n")
+                print("已取消，本轮结束👋。\n")
                 continue
             _user_input_lines.append("[plan-refined]")
         state.plans[symbol] = plan_steps
@@ -333,7 +336,7 @@ def run_chat(cfg: AppConfig) -> int:
         write_text(run_dir / "context.txt", ctx)
 
         analysis = analyze_with_llm(cfg, retrieval.discovery, context_override=ctx)
-        existing_map = scan_existing_rvv_content(ffmpeg_root, selected_files)
+        existing_map = scan_existing_rvv_content(ffmpeg_root, selected_files, symbol=symbol)
         if existing_map:
             print(f"\n检测到以下 RVV 文件已存在（将增量生成）：")
             for _ep in existing_map:
@@ -503,6 +506,22 @@ def run_chat(cfg: AppConfig) -> int:
                 print("\n未启用 board 配置（rvv_agent.toml [board]）。将跳过 scp/板端运行。")
                 state.scp_ok = False
                 state.run_on_board_ok = False
+
+        # Save LLM trajectory for this run
+        _traj = get_trajectory_dict(
+            model=cfg.llm.model,
+            endpoint=cfg.llm.base_url,
+        )
+        from .util import write_json as _wj
+        _wj(run_dir / "trajectory.json", _traj)
+        _tot = _traj.get("totals", {})
+        print(
+            f"\n[trajectory] calls={_tot.get('num_calls',0)}"
+            f"  in={_tot.get('input_tokens',0)}"
+            f"  out={_tot.get('output_tokens',0)}"
+            f"  cost=${_tot.get('cost_usd',0.0):.6f}"
+            f"  → {run_dir}/trajectory.json"
+        )
 
         report_path = write_report(
             run_dir,

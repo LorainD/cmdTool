@@ -49,7 +49,7 @@ def analyze_with_llm(
     ]
 
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=1400)
+        raw = chat_completion(cfg.llm, messages, max_tokens=1400, stage="analyze")
         data = json.loads(raw)
         return AnalysisResult(analysis=data, raw_text=raw, llm_used=True)
     except LlmError as e:

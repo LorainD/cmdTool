@@ -26,7 +26,13 @@ def build_context_from_files(
         except Exception:
             continue
 
-        hits: list[int] = [i for i, line in enumerate(lines) if token_re.search(line)]
+        # For assembly files, use plain substring match to correctly find
+        # functions like ff_sbr_neg_odd_64_neon when searching for neg_odd_64.
+        is_asm_file = p.suffix in {".S", ".s", ".asm"}
+        if is_asm_file:
+            hits: list[int] = [i for i, line in enumerate(lines) if symbol in line]
+        else:
+            hits = [i for i, line in enumerate(lines) if token_re.search(line)]
         if not hits:
             # Still include a small header snippet
             snippet = "\n".join(lines[: min(40, len(lines))])

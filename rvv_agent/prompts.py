@@ -59,8 +59,9 @@ def retrieval_prompt(symbol: str, grouped: dict, matches: list) -> str:
 
 要求：
 - 每个列表最多 5 个文件。
-- makefiles 至少包含 libavcodec/riscv/Makefile（如果不存在也照写）。
-- checkasm 建议给出 tests/checkasm/checkasm.c（若无法确定可留空数组）。
+- **x86** 和 **arm** 列表中必须优先包含 .S / .asm 等实际 SIMD 实现文件（如 sbrdsp.asm、sbrdsp_neon.S），
+  而不仅仅是 *_init*.c 注册文件——*_init*.c 只是函数指针赋值，真正的向量实现在汇编文件里。
+- 若 x86_refs 或 arm_refs 中同时有 init.c 和 .S/.asm，请把 .S/.asm 放在前面。
 """
 
 
@@ -71,19 +72,26 @@ def analysis_prompt(symbol: str, context: str) -> str:
 
 {{
   \"symbol\": \"{symbol}\",
-  \"datatype\": \"unknown|int16|int32|uint8|...\",
+  \"datatype\": \"float32|float64|int16|int32|int64|uint8|uint16|uint32|mixed\",
   \"vectorizable\": true|false,
   \"pattern\": [\"butterfly\", \"horizontal_add\", \"stride_load\", \"saturate\", \"tail\"],
   \"has_stride\": true|false,
   \"has_saturation\": true|false,
   \"reduction\": true|false,
   \"tail_required\": true|false,
-  \"math_expression\": \"...\",
+  \"math_expression\": \"精准数学伪代码，如 dst[i+1]=-dst[i+1] 或 out[i]=a[i]*b[i]\",
   \"c_candidates\": [\"path:line\", ...],
-  \"x86_refs\": [\"path:line\", ...],
-  \"arm_refs\": [\"path:line\", ...],
+  \"x86_refs\": [\"path:line\", ...],   // 优先包含 .S/.asm 实际 SIMD 实现，而非仅 init.c
+  \"arm_refs\": [\"path:line\", ...],   // 同上，NEON .S 文件比 init_arm.c 更重要
   \"notes\": \"...\"
 }}
+
+注意：
+- datatype 必须推断出具体类型（INTFLOAT 通常为 float32，不要填 unknown）；
+- math_expression 用精准数学伪代码表达核心运算；
+- x86_refs 和 arm_refs 应优先填写含实际 SIMD 指令的 .S / .asm 文件（如 sbrdsp.asm、sbrdsp_neon.S）
+  路径及函数定义行号，而不是仅填 *_init*.c 的行号—— init.c 只有函数指针赋值，
+  .S/.asm 才有可供参考的向量化实现逻辑。
 
 上下文：
 {context}
@@ -93,34 +101,41 @@ def analysis_prompt(symbol: str, context: str) -> str:
 def generation_prompt(symbol: str, analysis_json: str, existing_files_map: dict | None = None) -> str:
     existing_section = ""
     if existing_files_map:
-        parts = ["\n以下文件在 FFmpeg workspace 中已存在，必须在其基础上增量添加，不得删除或替换原有函数：\n"]
-        for path, content in existing_files_map.items():
+        parts = ["\n以下文件在 FFmpeg workspace 中已存在：\n"]
+        for path, cnt in existing_files_map.items():
             parts.append(f"--- 已有文件: {path} ---")
-            parts.append(content[:6000])
+            parts.append(cnt[:6000])
             parts.append("--- 文件结束 ---\n")
         existing_section = "\n".join(parts)
 
     return f"""基于下面的 JSON 分析，生成一个最小可编译的补丁包（不要解释）。
 
 要求：
-1) 只为 {symbol} 生成 RVV 实现。如果对应 .S 文件已存在（见下方"已有文件"），
-   必须把新函数追加到已有文件末尾，绝对不能删除或替换原有函数。
-2) 生成 init .c 的增量建议（unified diff 或明确片段，只添加新注册项）。
-3) 生成 Makefile 的增量建议（unified diff 或明确片段，如该文件已有该对象则跳过）。
-4) 如果无法确定确切落点/宏名，给出最保守的 TODO patch，但仍需保持格式可被人类直接应用。
+1) 为 {symbol} 生成 RVV 汇编实现（.S 文件）。
+   ★ 重要：.S 文件只输出**本次新增的函数**，不要包含任何已有函数的内容。
+   系统会自动将新函数追加到已有文件末尾，确保原有实现永不丢失。
+   新增函数需包含完整的汇编指令（.text/.globl/.type/label/.size/ret 等）。
+2) 修改 libavcodec/riscv/ 下对应的 *init*.c，添加函数注册。
+   *init*.c 必须输出**完整合并后的文件内容**（原有内容 + 新增注册代码）。
+3) 修改 libavcodec/riscv/Makefile，添加 .o 条目。
+   Makefile 也必须输出**完整合并后的文件内容**。
+4) 如果 C 源文件没有 riscv 入口，需仿照 x86/arm 格式插入（已有则忽略）。
 
-输出格式必须是严格 JSON（不要额外文字）：
+输出格式必须是严格 JSON（不要额外文字，patches 数组留空）：
 {{
   "files": [{{"path": "...", "content": "..."}}, ...],
-  "patches": [{{"path": "...", "diff": "..."}}, ...]
+  "patches": []
 }}
 
-注意：files 中的 content 字段，若对应文件已存在（见"已有文件"部分），
-content 必须包含原有全部内容 + 本次新增内容的完整合并结果。
+说明：
+- .S 文件 path 示例：libavcodec/riscv/{symbol}_rvv.S（**仅输出新增函数**）
+- *init*.c / Makefile：输出完整合并文件内容
 {existing_section}
 analysis_json:
 {analysis_json}
 """
+
+
 
 def plan_prompt(symbol: str) -> str:
     return f"""你是 FFmpeg RVV SIMD 迁移助手。请为迁移算子 {symbol} 生成一份具体的迁移计划。

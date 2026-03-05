@@ -26,7 +26,7 @@ def _iter_source_files(ffmpeg_root: Path) -> Iterable[Path]:
             continue
         if any(part in ex_dirs for part in path.parts):
             continue
-        if path.suffix not in {".c", ".h", ".S", ".s", ".inc", ".cpp"}:
+        if path.suffix not in {".c", ".h", ".S", ".s", ".inc", ".cpp", ".asm"}:
             continue
         yield path
 
@@ -56,11 +56,15 @@ def find_symbol_multi(
                 continue
             if term not in text:
                 continue
+            # For assembly files (.S/.asm), use plain substring match because
+            # function names like ff_sbr_neg_odd_64_neon contain the term with
+            # surrounding underscores that block \b word-boundary matching.
+            is_asm_file = file.suffix in {".S", ".s", ".asm"}
             lines_seen = seen_lines.setdefault(rel, set())
             for i, line in enumerate(text.splitlines(), start=1):
                 if i in lines_seen:
                     continue
-                if token_re.search(line):
+                if (is_asm_file and term in line) or (not is_asm_file and token_re.search(line)):
                     lines_seen.add(i)
                     all_matches.append(Match(file=rel, line=i, text=line.strip()))
                     if len(all_matches) >= max_matches:
@@ -82,8 +86,9 @@ def find_symbol(ffmpeg_root: Path, symbol: str, *, max_matches: int = 400) -> Di
         if symbol not in text:
             continue
 
+        is_asm_file = file.suffix in {".S", ".s", ".asm"}
         for i, line in enumerate(text.splitlines(), start=1):
-            if token_re.search(line):
+            if (is_asm_file and symbol in line) or (not is_asm_file and token_re.search(line)):
                 matches.append(
                     Match(
                         file=str(file.relative_to(ffmpeg_root)).replace("\\", "/"),

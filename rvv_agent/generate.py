@@ -53,32 +53,56 @@ def _extract_json(raw: str) -> dict:
 def scan_existing_rvv_content(
     ffmpeg_root: Path,
     ref_files: list[str],
+    symbol: str = "",
 ) -> dict[str, str]:
-    """Read any .S files in the ref_files list that already exist in ffmpeg_root.
+    """Read existing files that the LLM needs to do full-content merge.
 
-    Returns a dict mapping relative path -> existing content.
-    This is passed to the generation prompt so the LLM knows to ADD, not replace.
+    Only reads:
+    - Files explicitly listed in ref_files (filtered to init.c / Makefile)
+    - Makefile in libavcodec/riscv/
+    - *init*.c files in libavcodec/riscv/ whose name matches the module
+
+    .S files are intentionally NOT included here: the pipeline appends new
+    functions to .S files programmatically (in materialize_package), so the
+    LLM only needs to output the *new* functions, not the full merged content.
     """
     existing: dict[str, str] = {}
-    for rel in ref_files:
-        if not rel.endswith(".S"):
-            continue
+
+    def _read(rel: str) -> None:
         full = ffmpeg_root / rel
         if full.exists() and full.is_file():
             try:
                 existing[rel] = full.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 pass
-    # Also scan libavcodec/riscv/ for any .S files that look related
+
+    # Extract module name from symbol (e.g. "sbrdsp" from "sbrdsp.neg_odd_64")
+    module_lower = symbol.split(".")[0].lower() if symbol else ""
+
+    # From ref_files: only include init.c and Makefile (NOT .S files – those are appended)
+    for rel in ref_files:
+        p = Path(rel)
+        if p.suffix == ".S":
+            continue  # .S files handled by append logic in materialize_package
+        _read(rel)
+
+    # Scan libavcodec/riscv/ for Makefile and module-matched *init*.c
     riscv_dir = ffmpeg_root / "libavcodec" / "riscv"
     if riscv_dir.is_dir():
-        for f in riscv_dir.glob("*.S"):
-            rel = str(f.relative_to(ffmpeg_root))
-            if rel not in existing:
-                try:
-                    existing[rel] = f.read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    pass
+        for f in riscv_dir.iterdir():
+            if not f.is_file():
+                continue
+            rel = str(f.relative_to(ffmpeg_root)).replace("\\", "/")
+            if rel in existing:
+                continue
+            if f.name == "Makefile":
+                _read(rel)
+            elif "init" in f.name and f.suffix == ".c":
+                # Only read init.c files related to the current module
+                if not module_lower or module_lower in f.name.lower():
+                    _read(rel)
+            # .S files: deliberately excluded to avoid LLM accidentally overwriting
+
     return existing
 
 
@@ -102,7 +126,7 @@ def generate_with_llm(
     ]
 
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=2800)
+        raw = chat_completion(cfg.llm, messages, max_tokens=2800, stage="generate")
         data = _extract_json(raw)
         return GenerationResult(package=data, raw_text=raw, llm_used=True)
     except LlmError as e:
@@ -132,7 +156,7 @@ def fix_generation_with_llm(
         ),
     ]
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=2800)
+        raw = chat_completion(cfg.llm, messages, max_tokens=2800, stage="fix")
         data = _extract_json(raw)
         return GenerationResult(package=data, raw_text=raw, llm_used=True)
     except Exception as e:
@@ -154,7 +178,6 @@ def materialize_package(
 ) -> list[Path]:
     out_paths: list[Path] = []
 
-    # Use a sub-directory per attempt so retries don't overwrite previous artifacts
     attempt_suffix = f"_attempt{attempt}" if attempt > 0 else ""
     artifacts_dir = run_dir / f"artifacts{attempt_suffix}"
     ensure_dir(artifacts_dir)
@@ -174,15 +197,52 @@ def materialize_package(
         if apply:
             dst = ffmpeg_root / rel
             ensure_dir(dst.parent)
-            write_text(dst, content)
-            out_paths.append(dst)
 
-    # Save diff suggestions
+            # ── .S files: APPEND new functions instead of overwriting ─────────
+            # The LLM is instructed to output only the *new* functions.
+            # We append them to the end of any existing file so previously
+            # implemented RVV functions are never lost.
+            if rel.suffix == ".S" and dst.exists():
+                existing_content = dst.read_text(encoding="utf-8", errors="replace")
+                # Avoid duplicate: skip if this exact content is already present
+                if content.strip() and content.strip() not in existing_content:
+                    merged = existing_content.rstrip("\n") + "\n\n" + content.lstrip("\n")
+                    write_text(dst, merged)
+                    out_paths.append(dst)
+                # else: already applied, nothing to do
+            else:
+                write_text(dst, content)
+                out_paths.append(dst)
+
+    # Save diff suggestions and apply with `patch` if apply=True
     for patch in package.get("patches", []):
-        p_path = artifacts_dir / "patches" / Path(str(patch.get("path", "unknown"))).name
+        rel_patch = str(patch.get("path", ""))
         diff = str(patch.get("diff", ""))
-        if diff:
-            write_text(p_path.with_suffix(p_path.suffix + ".diff"), diff)
-            out_paths.append(p_path.with_suffix(p_path.suffix + ".diff"))
+        if not rel_patch or not diff:
+            continue
+        p_name = Path(rel_patch).name
+        p_path = artifacts_dir / "patches" / p_name
+        write_text(p_path.with_suffix(p_path.suffix + ".diff"), diff)
+        out_paths.append(p_path.with_suffix(p_path.suffix + ".diff"))
+
+        if apply:
+            import subprocess
+            target = ffmpeg_root / rel_patch
+            ensure_dir(target.parent)
+            diff_file = p_path.with_suffix(p_path.suffix + ".diff")
+            result = subprocess.run(
+                ["patch", "-p1", "--forward", "--reject-file=-",
+                 "-i", str(diff_file)],
+                cwd=str(ffmpeg_root),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                out_paths.append(target)
+            else:
+                write_text(
+                    artifacts_dir / "patches" / (p_name + ".patch_error.txt"),
+                    result.stdout + result.stderr,
+                )
 
     return out_paths

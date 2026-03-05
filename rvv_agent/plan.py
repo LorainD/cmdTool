@@ -39,7 +39,7 @@ def llm_plan(cfg: AppConfig, symbol: str) -> Plan:
         LlmMessage(role="user", content=plan_prompt(symbol)),
     ]
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=600)
+        raw = chat_completion(cfg.llm, messages, max_tokens=600, stage="plan")
         raw = raw.strip()
         # Extract JSON object
         start = raw.find("{")

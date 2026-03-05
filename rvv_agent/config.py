@@ -14,6 +14,10 @@ class LlmConfig:
     api_key_env: str = "LLM_API_KEY"
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
+    # Optional pricing for trajectory cost estimation ($/1M tokens).
+    # If 0, uses built-in defaults for known models.
+    cost_per_1m_input_tokens: float = 0.0
+    cost_per_1m_output_tokens: float = 0.0
 
 
 @dataclass
@@ -68,6 +72,8 @@ def _load_llm_table(base: LlmConfig, table: dict[str, object]) -> LlmConfig:
         api_key_env=str(table.get("api_key_env", base.api_key_env)).strip(),
         model=str(table.get("model", base.model)).strip(),
         temperature=float(table.get("temperature", base.temperature)),
+        cost_per_1m_input_tokens=float(table.get("cost_per_1m_input_tokens", base.cost_per_1m_input_tokens)),
+        cost_per_1m_output_tokens=float(table.get("cost_per_1m_output_tokens", base.cost_per_1m_output_tokens)),
     )
     return cfg
 

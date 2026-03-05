@@ -97,7 +97,7 @@ def select_references(cfg: AppConfig, ffmpeg_root: Path, intent_or_symbol: "Inte
     ]
 
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=900)
+        raw = chat_completion(cfg.llm, messages, max_tokens=900, stage="retrieve")
         data = _extract_json(raw)
         if not isinstance(data, dict):
             raise ValueError("retrieval json is not object")
