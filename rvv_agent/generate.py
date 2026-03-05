@@ -229,7 +229,9 @@ def materialize_package(
             import subprocess
             target = ffmpeg_root / rel_patch
             ensure_dir(target.parent)
-            diff_file = p_path.with_suffix(p_path.suffix + ".diff")
+            # .resolve() converts the relative path to absolute so that
+            # subprocess.run(cwd=ffmpeg_root) can still find the diff file.
+            diff_file = p_path.with_suffix(p_path.suffix + ".diff").resolve()
             result = subprocess.run(
                 ["patch", "-p1", "--forward", "--reject-file=-",
                  "-i", str(diff_file)],

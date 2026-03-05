@@ -95,3 +95,97 @@ def run_cmd_stream(
     proc.wait()
     combined = "".join(out_lines)
     return CmdResult(argv=list(argv), returncode=proc.returncode, stdout=combined, stderr="")
+
+
+# ---------------------------------------------------------------------------
+# Terminal color helpers
+# ---------------------------------------------------------------------------
+import sys as _sys
+
+_ANSI_RED    = "\033[31;1m"
+_ANSI_YELLOW = "\033[33;1m"
+_ANSI_RESET  = "\033[0m"
+
+
+def _color_supported() -> bool:
+    """Return True when the terminal likely supports ANSI colors."""
+    # Honour NO_COLOR convention; also skip if piped
+    import os
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return _sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def print_red(msg: str) -> None:
+    """Print *msg* in bold red to stdout (falls back to plain if no TTY)."""
+    if _color_supported():
+        print(f"{_ANSI_RED}{msg}{_ANSI_RESET}")
+    else:
+        print(msg)
+
+
+def print_yellow(msg: str) -> None:
+    """Print *msg* in bold yellow to stdout."""
+    if _color_supported():
+        print(f"{_ANSI_YELLOW}{msg}{_ANSI_RESET}")
+    else:
+        print(msg)
+
+
+def print_llm_error(err: Exception | str, stage: str = "") -> None:
+    """Classify *err* and print an actionable red-text diagnosis.
+
+    Distinguishes between:
+    - connection / timeout failures → remind user to check network / endpoint
+    - auth errors (401/403)         → remind user to refresh API key
+    - rate limit (429)              → suggest waiting or switching key
+    - other errors                  → generic LLM failure message
+    """
+    import urllib.error
+
+    msg = str(err)
+    stage_tag = f"[{stage}] " if stage else ""
+
+    if isinstance(err, urllib.error.URLError) or "urlopen error" in msg or "Connection" in msg or "Timeout" in msg or "timed out" in msg.lower():
+        print_red(
+            f"\n{'='*60}\n"
+            f"  {stage_tag}⚠  LLM 网络连接失败 / 超时，无法访问接口！\n"
+            f"  请检查：① 网络连通性  ② rvv_agent.toml 中的 base_url\n"
+            f"  错误详情：{msg[:300]}\n"
+            f"{'='*60}\n"
+        )
+    elif "401" in msg or "403" in msg or "Unauthorized" in msg or "Forbidden" in msg:
+        print_red(
+            f"\n{'='*60}\n"
+            f"  {stage_tag}⚠  LLM 认证失败！API key 无效或已过期。\n"
+            f"  请更新环境变量 (export API_KEY=...) 或 rvv_agent.toml 配置。\n"
+            f"  错误详情：{msg[:300]}\n"
+            f"{'='*60}\n"
+        )
+    elif "429" in msg or "rate limit" in msg.lower() or "quota" in msg.lower():
+        print_red(
+            f"\n{'='*60}\n"
+            f"  {stage_tag}⚠  LLM 速率限制 / 配额耗尽！\n"
+            f"  请稍等片刻后重试，或更换 API key / endpoint。\n"
+            f"  错误详情：{msg[:300]}\n"
+            f"{'='*60}\n"
+        )
+    elif "Missing API key" in msg or "api_key_env" in msg:
+        print_red(
+            f"\n{'='*60}\n"
+            f"  {stage_tag}⚠  未找到 API key！\n"
+            f"  请设置对应的环境变量（见 rvv_agent.toml 中的 api_key_env 配置）。\n"
+            f"  错误详情：{msg[:300]}\n"
+            f"{'='*60}\n"
+        )
+    else:
+        print_red(
+            f"\n{'='*60}\n"
+            f"  {stage_tag}⚠  LLM 调用失败！\n"
+            f"  如多次出现，请检查 endpoint_url / API key / 网络。\n"
+            f"  错误详情：{msg[:300]}\n"
+            f"{'='*60}\n"
+        )

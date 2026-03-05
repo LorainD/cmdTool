@@ -53,8 +53,8 @@ class TrajectoryEvent:
             "cumulative_output_tokens": self.cumulative_output_tokens,
             "cumulative_cost_usd": round(self.cumulative_cost_usd, 8),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
-            "prompt": self.prompt[:2000],
-            "response": self.response[:4000],
+            "prompt": self.prompt[:2000].splitlines(),
+            "response": self.response[:4000].splitlines(),
         }
 
 

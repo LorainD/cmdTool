@@ -19,7 +19,6 @@ from .generate import (
     fix_generation_with_llm,
     generate_with_llm,
     materialize_package,
-    scan_existing_rvv_content,
 )
 from .intent import parse_intent
 from .interactive import prompt_secret, prompt_text, prompt_yes_no
@@ -28,7 +27,7 @@ from .plan import fixed_plan, llm_plan
 from .prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
 from .retrieve import select_references
-from .util import ensure_dir, fmt_argv, now_id, slug, write_text
+from .util import ensure_dir, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
 
 
 @dataclass
@@ -221,7 +220,7 @@ def run_chat(cfg: AppConfig) -> int:
                 print(reply + "\n")
                 history.append(LlmMessage(role="assistant", content=reply))
             except Exception as e:
-                print("（当前未能调用外部 LLM。请检查 API key/endpoint_url。）")
+                print_llm_error(e, "chat")
                 print(f"错误：{e}\n")
             continue
 
@@ -298,19 +297,15 @@ def run_chat(cfg: AppConfig) -> int:
             selected_files.extend(_list(k))
         selected_files = list(dict.fromkeys(selected_files))
 
-        if retrieval.existing_rvv:
-            print("\n已发现以下现有 RVV 实现文件（将作为增量基础）：")
-            for _r in retrieval.existing_rvv:
-                print(f"  [existing] {_r}")
-
-        print("\n检索/选择出的参考文件：")
-        for p in selected_files:
-            print(f"- {p}")
-
-        # Always include existing RVV files in selected_files so they are used as context
+        # Merge existing RVV files into selected_files (deduplicated)
         for _r in retrieval.existing_rvv:
             if _r not in selected_files:
                 selected_files.append(_r)
+
+        print("\n检索/选择出的参考文件：")
+        for p in selected_files:
+            _tag = "[existing-rvv] " if p in retrieval.existing_rvv else ""
+            print(f"  {_tag}{p}")
 
         # Use cached file list for this symbol if already refined
         if symbol in state.ref_files:
@@ -335,14 +330,30 @@ def run_chat(cfg: AppConfig) -> int:
         ctx = build_context_from_files(ffmpeg_root, symbol=symbol, files=selected_files)
         write_text(run_dir / "context.txt", ctx)
 
+        print("\n⚙ 正在分析算子实现…")
         analysis = analyze_with_llm(cfg, retrieval.discovery, context_override=ctx)
-        existing_map = scan_existing_rvv_content(ffmpeg_root, selected_files, symbol=symbol)
+
+        # Build existing_map from selected_files (non-.S files already on disk).
+        # selected_files already contains retrieval.existing_rvv, so no extra
+        # rescan of libavcodec/riscv/ is needed.
+        existing_map: dict[str, str] = {}
+        for _rel in selected_files:
+            _full = ffmpeg_root / _rel
+            if _full.exists() and _full.is_file() and not _rel.endswith(".S"):
+                try:
+                    existing_map[_rel] = _full.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
         if existing_map:
-            print(f"\n检测到以下 RVV 文件已存在（将增量生成）：")
+            print("\n以下现有文件将作为 LLM 增量生成基础（来自 reference 集合）：")
             for _ep in existing_map:
-                print(f"  - {_ep}")
+                print(f"  [existing] {_ep}")
+
+        print("\n⚙ 正在调用 LLM 生成 RVV 代码…（可能需要 20–60 秒）")
         gen = generate_with_llm(cfg, symbol, analysis.analysis,
                                existing_files_map=existing_map or None)
+        if gen.error:
+            print_llm_error(gen.error, "generate")
 
         # ── Step 1: Apply generated files to FFmpeg workspace ─────────────────
         if state.apply_ok is None:
@@ -392,6 +403,12 @@ def run_chat(cfg: AppConfig) -> int:
                 # ─ configure phase ─
                 print(f"\n正在运行 configure（第 {build_attempt+1} 次尝试，输出实时显示）…")
                 exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
+                # 追加本次 configure 输出到统一日志
+                with open(run_dir / "build_log.txt", "a", encoding="utf-8") as _bl:
+                    _bl.write(f"\n{'='*60}\n")
+                    _bl.write(f"configure attempt {build_attempt+1}\n")
+                    _bl.write(f"{'='*60}\n")
+                    _bl.write(exec_result.configure.stdout)
 
                 if exec_result.configure.returncode != 0:
                     cfg_err = exec_result.configure.stdout[:4000]
@@ -410,6 +427,7 @@ def run_chat(cfg: AppConfig) -> int:
                     print(f"\n正在让 LLM 修复（configure 错误）…")
                     fix_result = fix_generation_with_llm(cfg, symbol, cfg_err, gen.package)
                     if fix_result.error:
+                        print_llm_error(fix_result.error, f"fix/configure#{build_attempt}")
                         print(f"LLM 修复请求失败：{fix_result.error}")
                         break
                     gen = fix_result
@@ -423,6 +441,13 @@ def run_chat(cfg: AppConfig) -> int:
                 # ─ make phase ─
                 print("\nconfigure 完成，开始构建 checkasm…")
                 exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
+                # 追加本次 make 输出到统一日志
+                with open(run_dir / "build_log.txt", "a", encoding="utf-8") as _bl:
+                    _bl.write(f"\n{'='*60}\n")
+                    _bl.write(f"make checkasm attempt {build_attempt+1}\n")
+                    _bl.write(f"{'='*60}\n")
+                    _bl.write(exec_result.make_checkasm.stdout)
+                    _bl.write(exec_result.make_checkasm.stderr)
                 if exec_result.make_checkasm.returncode == 0:
                     print(f"\n构建成功（第 {build_attempt+1} 次尝试）✓")
                     break
@@ -444,6 +469,7 @@ def run_chat(cfg: AppConfig) -> int:
                 print(f"\n正在让 LLM 修复（make 错误）…")
                 fix_result = fix_generation_with_llm(cfg, symbol, make_err, gen.package)
                 if fix_result.error:
+                    print_llm_error(fix_result.error, f"fix/make#{build_attempt}")
                     print(f"LLM 修复请求失败：{fix_result.error}")
                     break
                 gen = fix_result
