@@ -189,3 +189,56 @@ def print_llm_error(err: Exception | str, stage: str = "") -> None:
             f"  错误详情：{msg[:300]}\n"
             f"{'='*60}\n"
         )
+
+
+# ---------------------------------------------------------------------------
+# Smart build-error extractor
+# ---------------------------------------------------------------------------
+import re as _re
+
+_ERROR_PATTERNS = _re.compile(
+    r"(error:|fatal error:|undefined reference|ld returned|cannot find|"
+    r"no such file|implicit declaration|conflicting types|"
+    r"note:|warning:.*error|make\[\d+\].*Error)",
+    _re.IGNORECASE,
+)
+
+
+def extract_build_errors(output: str, tail_lines: int = 60, max_chars: int = 4000) -> str:
+    """Return the most diagnostically useful portion of a build log.
+
+    Strategy (in priority order):
+    1. Collect every line that matches a known compiler/linker error pattern.
+    2. Always include the last *tail_lines* lines (errors appear at the end).
+    3. Deduplicate while preserving original order.
+    4. Cap the result at *max_chars* characters (taken from the **end**,
+       so the most recent errors are never truncated).
+    """
+    lines = output.splitlines()
+    if not lines:
+        return output[:max_chars]
+
+    seen: set[int] = set()
+    selected: list[tuple[int, str]] = []
+
+    # Pass 1 – error-pattern lines
+    for i, ln in enumerate(lines):
+        if _ERROR_PATTERNS.search(ln):
+            seen.add(i)
+            selected.append((i, ln))
+
+    # Pass 2 – tail lines
+    tail_start = max(0, len(lines) - tail_lines)
+    for i in range(tail_start, len(lines)):
+        if i not in seen:
+            seen.add(i)
+            selected.append((i, lines[i]))
+
+    # Sort by original line number to restore context order
+    selected.sort(key=lambda t: t[0])
+    result = "\n".join(ln for _, ln in selected)
+
+    # Cap from the end so the most recent diagnostics are always present
+    if len(result) > max_chars:
+        result = result[-max_chars:]
+    return result

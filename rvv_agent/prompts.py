@@ -116,9 +116,9 @@ def generation_prompt(symbol: str, analysis_json: str, existing_files_map: dict 
    最后输出完整合并后的文件内容（原有内容+新增算子函数）；如果ffmpeg中不存在相关实现，就生成新的.S文件，
    新增函数需包含完整的汇编指令（.text/.globl/.type/label/.size/ret 等）。只为 {symbol} 生成 RVV 实现。如果对应 .S 文件已存在（见下方"已有文件"），
    必须把新函数追加到已有文件末尾，绝对不能删除或替换原有函数。
-2) 修改 libavcodec/riscv/ 下对应的 *init*.c，添加函数注册。
+2) 修改 libav*/riscv/ 下对应的 *init*.c，添加函数注册。
    *init*.c 必须输出**完整合并后的文件内容**（原有内容 + 新增注册代码）。同时生成init .c 的增量建议（unified diff 或明确片段，只添加新注册项）。
-3) 如果生成了新的.S文件，需要修改 libavcodec/riscv/Makefile，添加 .o 条目。
+3) 如果生成了新的.S文件和init文件，需要修改 libav*/riscv/Makefile，添加 .o 条目。绝对不能删除或替换原有内容！
    Makefile 也必须输出**完整合并后的文件内容**。（如果只是在已有.S文件中新增函数则忽略）。同时生成 Makefile 的增量建议（unified diff 或明确片段）。
 4) 如果 C 源文件没有 riscv 入口，需仿照 x86/arm 格式插入（已有则忽略）。
 

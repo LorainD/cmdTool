@@ -27,7 +27,7 @@ from .plan import fixed_plan, llm_plan
 from .prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
 from .retrieve import select_references
-from .util import ensure_dir, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
+from .util import ensure_dir, extract_build_errors, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
 
 
 @dataclass
@@ -411,12 +411,12 @@ def run_chat(cfg: AppConfig) -> int:
                     _bl.write(exec_result.configure.stdout)
 
                 if exec_result.configure.returncode != 0:
-                    cfg_err = exec_result.configure.stdout[:4000]
+                    cfg_err = extract_build_errors(exec_result.configure.stdout)
                     print(f"\nconfigure 失败（returncode={exec_result.configure.returncode}）")
                     build_attempt += 1
                     if build_attempt > MAX_BUILD_RETRIES:
                         print(f"\nconfigure 已连续失败 {MAX_BUILD_RETRIES} 次，请人工处理。")
-                        print(f"错误信息片段：\n{cfg_err[:800]}\n")
+                        print(f"错误信息片段（智能提取）：\n{cfg_err[-800:]}\n")
                         break
                     if not prompt_yes_no(
                         f"\n是否让 LLM 分析 configure 错误并迭代修复（第 {build_attempt}/{MAX_BUILD_RETRIES} 次）？",
@@ -453,12 +453,13 @@ def run_chat(cfg: AppConfig) -> int:
                     break
 
                 # make failed
-                make_err = (exec_result.make_checkasm.stdout +
-                            exec_result.make_checkasm.stderr)[:4000]
+                make_err = extract_build_errors(
+                    exec_result.make_checkasm.stdout + exec_result.make_checkasm.stderr
+                )
                 build_attempt += 1
                 if build_attempt > MAX_BUILD_RETRIES:
                     print(f"\n构建连续失败 {MAX_BUILD_RETRIES} 次，请人工处理。")
-                    print(f"错误信息片段：\n{make_err[:800]}\n")
+                    print(f"错误信息片段（智能提取）：\n{make_err[-800:]}\n")
                     break
                 if not prompt_yes_no(
                     f"\n是否让 LLM 分析 make 错误并迭代修复（第 {build_attempt}/{MAX_BUILD_RETRIES} 次）？",
