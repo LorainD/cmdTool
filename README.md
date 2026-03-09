@@ -18,11 +18,37 @@
 ## 目录结构
 
 ```
-bin/rvv-agent          CLI 入口
-rvv_agent/             核心代码
-rvv_agent.toml         配置文件
-runs/                  每次运行的产物
-workplace/FFmpeg/      FFmpeg 工作区（vendor clone）
+bin/rvv-agent              CLI 入口脚本
+rvv_agent.toml             配置文件
+runs/                      每次运行的产物
+workplace/FFmpeg/          FFmpeg 工作区（vendor clone）
+
+rvv_agent/                 核心代码包
+├── __init__.py
+├── cli.py                 命令行入口（plan / migrate / chat 子命令）
+├── pipeline.py            非交互式 migrate 流水线
+│
+├── core/                  基础层（无业务依赖）
+│   ├── config.py          AppConfig / LlmConfig / 配置加载（rvv_agent.toml）
+│   ├── llm.py             LLM 客户端、trajectory 统计
+│   ├── prompts.py         所有 Prompt 模板
+│   └── util.py            通用工具（文件 I/O、shell、格式化等）
+│
+├── agent/                 Agent 层（核心智能逻辑）
+│   ├── chat.py            human-in-the-loop 交互式迁移循环
+│   ├── debug.py           非交互式 LLM 构建错误修复循环
+│   ├── generate.py        Plan / 语义分析 / LLM 代码生成与修复
+│   ├── intent.py          用户意图解析
+│   ├── report.py          运行报告落盘
+│   └── search.py          源码搜索、参考文件检索、上下文构建
+│
+├── tool/                  执行层（外部工具调用）
+│   ├── board.py           板端 scp / ssh 操作
+│   ├── exec.py            交叉编译（configure / make checkasm）
+│   └── interactive.py     终端交互（prompt_text / yes_no / secret）
+│
+└── memory/                经验记忆层（接口预留，待实现）
+    └── pattern_lib.py     RvvPattern / PatternLib stub
 ```
 
 ---

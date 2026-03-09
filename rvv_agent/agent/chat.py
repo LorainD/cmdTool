@@ -4,11 +4,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .analyze import analyze_with_llm
-from .board import build_board_commands, local_checkasm_path, run_with_sshpass
-from .config import AppConfig
-from .context import build_context_from_files
-from .exec import (
+from .generate import analyze_with_llm
+from ..tool.board import build_board_commands, local_checkasm_path, run_with_sshpass
+from ..core.config import AppConfig
+from .search import build_context_from_files
+from ..tool.exec import (
     ExecResult,
     configure_argv,
     make_checkasm_argv,
@@ -21,13 +21,13 @@ from .generate import (
     materialize_package,
 )
 from .intent import parse_intent
-from .interactive import prompt_secret, prompt_text, prompt_yes_no
-from .llm import LlmMessage, chat_completion, probe_llm, reset_trajectory, get_trajectory_dict
-from .plan import fixed_plan, llm_plan
-from .prompts import files_refine_prompt, plan_refine_prompt, system_prompt
+from ..tool.interactive import prompt_secret, prompt_text, prompt_yes_no
+from ..core.llm import LlmMessage, chat_completion, probe_llm, reset_trajectory, get_trajectory_dict
+from .generate import fixed_plan, llm_plan
+from ..core.prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
-from .retrieve import select_references
-from .util import ensure_dir, extract_build_errors, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
+from .search import select_references
+from ..core.util import ensure_dir, extract_build_errors, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
 
 
 @dataclass
@@ -100,8 +100,8 @@ def _refine_plan(cfg: AppConfig, symbol: str, steps: list[str], history: list[di
             return steps
         if feedback.lower() in {"/skip", "/cancel"}:
             return []  # empty → caller should cancel
-        from .llm import LlmMessage, chat_completion
-        from .prompts import plan_refine_prompt, system_prompt
+        from ..core.llm import LlmMessage, chat_completion
+        from ..core.prompts import plan_refine_prompt, system_prompt
         try:
             raw = chat_completion(
                 cfg.llm,
@@ -141,8 +141,8 @@ def _refine_files(cfg: AppConfig, symbol: str, files: list[str], history: list[d
             return files
         if feedback.lower() in {"/skip", "/cancel"}:
             return []
-        from .llm import LlmMessage, chat_completion
-        from .prompts import files_refine_prompt, system_prompt
+        from ..core.llm import LlmMessage, chat_completion
+        from ..core.prompts import files_refine_prompt, system_prompt
         import json
         try:
             raw = chat_completion(
@@ -276,7 +276,7 @@ def run_chat(cfg: AppConfig) -> int:
         state.plans[symbol] = plan_steps
         # Update user_input log with any refine feedback
         write_text(run_dir / 'user_input.txt', '\n'.join(_user_input_lines) + '\n')
-        from .plan import Plan as _Plan
+        from .generate import Plan as _Plan
         plan = _Plan(steps=plan_steps)
 
         ffmpeg_root = cfg.ffmpeg.root.expanduser().resolve()
@@ -539,7 +539,7 @@ def run_chat(cfg: AppConfig) -> int:
             model=cfg.llm.model,
             endpoint=cfg.llm.base_url,
         )
-        from .util import write_json as _wj
+        from ..core.util import write_json as _wj
         _wj(run_dir / "trajectory.json", _traj)
         _tot = _traj.get("totals", {})
         print(

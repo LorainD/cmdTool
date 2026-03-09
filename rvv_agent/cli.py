@@ -5,10 +5,10 @@ import os
 import sys
 from pathlib import Path
 
-from .chat import run_chat
-from .config import load_config
+from .agent.chat import run_chat
+from .core.config import load_config
 from .pipeline import run_migrate
-from .plan import fixed_plan
+from .agent.generate import fixed_plan
 
 
 def _resolve_path(p: str | None) -> Path | None:

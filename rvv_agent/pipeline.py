@@ -4,19 +4,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .analyze import AnalysisResult, analyze_with_llm
-from .config import AppConfig
-from .exec import ExecResult, run_configure, run_make_checkasm
-from .generate import (
+from .agent.generate import AnalysisResult, analyze_with_llm
+from .core.config import AppConfig
+from .tool.exec import ExecResult, run_configure, run_make_checkasm
+from .agent.generate import (
     GenerationResult,
     fix_generation_with_llm,
     generate_with_llm,
     materialize_package,
 )
-from .plan import fixed_plan
-from .report import write_report
-from .search import Discovery, find_symbol
-from .util import ensure_dir, now_id, slug, write_text
+from .agent.generate import fixed_plan
+from .agent.report import write_report
+from .agent.search import Discovery, find_symbol
+from .core.util import ensure_dir, now_id, slug, write_text
 
 
 # Maximum number of LLM-fix attempts after a configure/build error

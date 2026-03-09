@@ -1,13 +1,13 @@
+"""agent.report — 运行报告生成"""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from .analyze import AnalysisResult
-from .exec import ExecResult
-from .plan import Plan
+from ..core.util import CmdResult, ensure_dir, fmt_argv, write_json, write_text
+from ..tool.exec import ExecResult
+from .generate import AnalysisResult, Plan
 from .search import Discovery, group_files
-from .util import CmdResult, ensure_dir, fmt_argv, write_json, write_text
 
 
 def _cmd_section(title: str, res: CmdResult | None) -> str:
@@ -85,7 +85,6 @@ def write_report(
 
     md.append("## Materialized\n")
     md.append("\n".join(f"- {p}" for p in materialized) if materialized else "- (none)")
-
     md.append("")
     md.append(_cmd_section("configure", exec_result.configure))
     md.append(_cmd_section("make checkasm", exec_result.make_checkasm))
@@ -93,7 +92,10 @@ def write_report(
     report_path = run_dir / "report.md"
     write_text(report_path, "\n".join(md))
 
-    write_json(run_dir / "discovery.json", {"symbol": discovery.symbol, "matches": [m.__dict__ for m in discovery.matches]})
+    write_json(run_dir / "discovery.json", {
+        "symbol": discovery.symbol,
+        "matches": [m.__dict__ for m in discovery.matches],
+    })
     write_json(run_dir / "analysis.json", analysis.analysis)
 
     return report_path
