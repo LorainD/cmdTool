@@ -43,6 +43,7 @@ class TrajectoryEvent:
 
     def to_dict(self) -> dict:
         return {
+            "event_type": "llm_call",
             "timestamp": self.timestamp,
             "stage": self.stage,
             "input_tokens": self.input_tokens,
@@ -58,9 +59,28 @@ class TrajectoryEvent:
         }
 
 
+@dataclass
+class ActionEvent:
+    """Non-LLM trajectory event: agent action or human-facing output."""
+    timestamp: str
+    event_type: str   # "action" | "human_output"
+    stage: str
+    description: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": self.event_type,
+            "timestamp": self.timestamp,
+            "stage": self.stage,
+            "description": self.description,
+            "detail": self.detail[:4000],
+        }
+
+
 class _Trajectory:
     def __init__(self) -> None:
-        self._events: list[TrajectoryEvent] = []
+        self._events: list = []  # TrajectoryEvent | ActionEvent
         self._cum_in = 0
         self._cum_out = 0
         self._cum_cost = 0.0
@@ -102,7 +122,25 @@ class _Trajectory:
         )
         self._events.append(evt)
 
+    def record_action(
+        self,
+        stage: str,
+        description: str,
+        detail: str = "",
+        event_type: str = "action",
+    ) -> None:
+        """Record a non-LLM agent action or human-facing output event."""
+        evt = ActionEvent(
+            timestamp=dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            event_type=event_type,
+            stage=stage,
+            description=description,
+            detail=detail,
+        )
+        self._events.append(evt)
+
     def to_dict(self, model: str = "", endpoint: str = "") -> dict:
+        llm_calls = [e for e in self._events if isinstance(e, TrajectoryEvent)]
         return {
             "model": model,
             "endpoint": endpoint,
@@ -112,7 +150,8 @@ class _Trajectory:
                 "output_tokens": self._cum_out,
                 "total_tokens": self._cum_in + self._cum_out,
                 "cost_usd": round(self._cum_cost, 8),
-                "num_calls": len(self._events),
+                "num_calls": len(llm_calls),
+                "num_events": len(self._events),
             },
         }
 
@@ -131,6 +170,16 @@ def reset_trajectory() -> None:
 
 def get_trajectory_dict(model: str = "", endpoint: str = "") -> dict:
     return _TRAJECTORY.to_dict(model=model, endpoint=endpoint)
+
+
+def record_trajectory_action(
+    stage: str,
+    description: str,
+    detail: str = "",
+    event_type: str = "action",
+) -> None:
+    """Record a non-LLM agent action or human-facing output to the trajectory."""
+    _TRAJECTORY.record_action(stage, description, detail, event_type)
 
 
 # ---------------------------------------------------------------------------

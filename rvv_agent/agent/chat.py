@@ -18,11 +18,11 @@ from ..tool.exec import (
 from .generate import (
     fix_generation_with_llm,
     generate_with_llm,
-    materialize_package,
 )
+from .inject import inject_generate_plan
 from .intent import parse_intent
 from ..tool.interactive import prompt_secret, prompt_text, prompt_yes_no
-from ..core.llm import LlmMessage, chat_completion, probe_llm, reset_trajectory, get_trajectory_dict
+from ..core.llm import LlmMessage, chat_completion, probe_llm, reset_trajectory, get_trajectory_dict, record_trajectory_action
 from .generate import fixed_plan, llm_plan
 from ..core.prompts import files_refine_prompt, plan_refine_prompt, system_prompt
 from .report import write_report
@@ -288,6 +288,12 @@ def run_chat(cfg: AppConfig) -> int:
             _user_input_lines.append("[plan-refined]")
         state.plans[symbol] = plan_steps
         dctx.update_plan(plan_steps)  # 同步到 DynamicContext（不可压缩）
+        record_trajectory_action(
+            "plan",
+            f"Migration plan confirmed for {symbol}",
+            detail="\n".join(plan_steps),
+            event_type="human_output",
+        )
         # Update user_input log with any refine feedback
         write_text(run_dir / 'user_input.txt', '\n'.join(_user_input_lines) + '\n')
         from .generate import Plan as _Plan
@@ -335,6 +341,12 @@ def run_chat(cfg: AppConfig) -> int:
                 print("已取消，本轮结束。\n")
                 continue
         state.ref_files[symbol] = selected_files
+        record_trajectory_action(
+            "select_refs",
+            f"Reference files confirmed ({len(selected_files)} files)",
+            detail="\n".join(selected_files),
+            event_type="human_output",
+        )
         # Persist final selected files back to retrieval_raw
         import json as _json
         write_text(run_dir / 'retrieval_raw.txt',
@@ -356,6 +368,12 @@ def run_chat(cfg: AppConfig) -> int:
         )
         # 更新 DynamicContext 中的 analysis（不可压缩）
         dctx.update_analysis(analysis.analysis, analysis.raw_text)
+        record_trajectory_action(
+            "analyze",
+            f"Operator analysis complete (llm_used={analysis.llm_used})",
+            detail=analysis.raw_text[:2000],
+            event_type="human_output",
+        )
         # 落盘到 run_dir/analysis.json
         from ..core.util import write_json as _wj_a
         _wj_a(run_dir / "analysis.json", analysis.analysis)
@@ -388,21 +406,29 @@ def run_chat(cfg: AppConfig) -> int:
                 "\n是否把生成文件写入 FFmpeg workspace（workplace/FFmpeg）？",
             )
 
-        # materialize to runs/artifacts/ for traceability; also apply if confirmed
-        materialized = materialize_package(
+        # Inject generated files to FFmpeg workspace (append-only, never overwrites)
+        _inject_result = inject_generate_plan(
             run_dir,
             ffmpeg_root,
-            gen.package,
+            gen.generate_plan,
             apply=bool(state.apply_ok),
+            attempt=0,
+            cfg=cfg,
+        )
+        materialized = _inject_result.applied_paths
+        record_trajectory_action(
+            "generate",
+            f"Code generated (llm_used={gen.llm_used}), apply={state.apply_ok}",
+            detail=f"files: {[i.get('target_path','') for i in gen.generate_plan.get('generated', [])]}",
         )
         if state.apply_ok:
-            print("\n已将生成文件写入 FFmpeg workspace：")
+            print("\n已将生成文件注入 FFmpeg workspace（append 模式，不覆盖已有代码）：")
             for _mp in materialized:
                 _mp_r = Path(_mp)
-                if ffmpeg_root in _mp_r.parents or _mp_r.is_relative_to(ffmpeg_root):
+                if _mp_r.is_relative_to(ffmpeg_root):
                     print(f"  → {_mp_r}")
         else:
-            print("\n已将生成文件保存到 runs/（未写入 FFmpeg）。")
+            print("\n已将生成计划保存到 runs/（未写入 FFmpeg）。")
 
         exec_result = ExecResult()
         import os
@@ -454,8 +480,13 @@ def run_chat(cfg: AppConfig) -> int:
                     print(f"\n正在让 LLM 修复（configure 错误）…")
                     # 追加构建错误到 DynamicContext（永久保留）
                     dctx.append_build_error("configure", build_attempt, cfg_err)
+                    record_trajectory_action(
+                        "build_error_configure",
+                        f"Configure failed (attempt {build_attempt})",
+                        detail=cfg_err[-1000:],
+                    )
                     fix_result = fix_generation_with_llm(
-                        cfg, symbol, cfg_err, gen.package,
+                        cfg, symbol, cfg_err, gen.generate_plan,
                         analysis=dctx.analysis or None,
                         all_prior_errors=dctx.build_errors_for_llm() or None,
                     )
@@ -466,9 +497,13 @@ def run_chat(cfg: AppConfig) -> int:
                     gen = fix_result
                     write_text(run_dir / f"fix_attempt{build_attempt}_configure_raw.txt", gen.raw_text)
                     if state.apply_ok:
-                        materialize_package(run_dir, ffmpeg_root, gen.package,
-                                            apply=True, attempt=build_attempt)
-                        print(f"已将修复后的文件重新写入 FFmpeg workspace（configure 修复 #{build_attempt}）")
+                        inject_generate_plan(run_dir, ffmpeg_root, gen.generate_plan,
+                                             apply=True, attempt=build_attempt, cfg=cfg)
+                        print(f"已将修复后的文件重新注入 FFmpeg workspace（configure 修复 #{build_attempt}，append 模式）")
+                    record_trajectory_action(
+                        "fix_inject",
+                        f"Configure fix #{build_attempt} injected",
+                    )
                     continue  # retry configure with fixed files
 
                 # ─ make phase ─
@@ -483,6 +518,10 @@ def run_chat(cfg: AppConfig) -> int:
                     _bl.write(exec_result.make_checkasm.stderr)
                 if exec_result.make_checkasm.returncode == 0:
                     print(f"\n构建成功（第 {build_attempt+1} 次尝试）✓")
+                    record_trajectory_action(
+                        "build_success",
+                        f"Build succeeded (attempt {build_attempt+1})",
+                    )
                     break
 
                 # make failed
@@ -503,8 +542,13 @@ def run_chat(cfg: AppConfig) -> int:
                 print(f"\n正在让 LLM 修复（make 错误）…")
                 # 追加构建错误到 DynamicContext（永久保留）
                 dctx.append_build_error("make", build_attempt, make_err)
+                record_trajectory_action(
+                    "build_error_make",
+                    f"Make checkasm failed (attempt {build_attempt})",
+                    detail=make_err[-1000:],
+                )
                 fix_result = fix_generation_with_llm(
-                    cfg, symbol, make_err, gen.package,
+                    cfg, symbol, make_err, gen.generate_plan,
                     analysis=dctx.analysis or None,
                     all_prior_errors=dctx.build_errors_for_llm() or None,
                 )
@@ -515,9 +559,13 @@ def run_chat(cfg: AppConfig) -> int:
                 gen = fix_result
                 write_text(run_dir / f"fix_attempt{build_attempt}_raw.txt", gen.raw_text)
                 if state.apply_ok:
-                    materialize_package(run_dir, ffmpeg_root, gen.package,
-                                        apply=True, attempt=build_attempt)
-                    print(f"已将修复后的文件重新写入 FFmpeg workspace（make 修复 #{build_attempt}）")
+                    inject_generate_plan(run_dir, ffmpeg_root, gen.generate_plan,
+                                         apply=True, attempt=build_attempt, cfg=cfg)
+                    print(f"已将修复后的文件重新注入 FFmpeg workspace（make 修复 #{build_attempt}，append 模式）")
+                record_trajectory_action(
+                    "fix_inject",
+                    f"Make fix #{build_attempt} injected",
+                )
                 # continue loop: re-run configure then make with fixed files
 
         # Board steps

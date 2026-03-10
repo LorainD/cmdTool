@@ -124,10 +124,7 @@ def run_migrate(
                     break
                 ctx.current_gen = fixed_gen
                 save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
-                inject_generate_plan(
-                    ctx.run_dir, ffmpeg_root, fixed_gen.generate_plan,
-                    apply=apply, attempt=attempt, cfg=cfg,
-                )
+                ctx = insert_stage(ctx, attempt=attempt)
                 ctx.exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
                 if ctx.exec_result.configure.returncode == 0:
                     exec_failed = False
@@ -165,10 +162,7 @@ def run_migrate(
                         break
                     ctx.current_gen = fixed_gen
                     save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
-                    inject_generate_plan(
-                        ctx.run_dir, ffmpeg_root, fixed_gen.generate_plan,
-                        apply=apply, attempt=attempt, cfg=cfg,
-                    )
+                    ctx = insert_stage(ctx, attempt=attempt)
                     ctx.exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
                     if ctx.exec_result.make_checkasm.returncode == 0:
                         exec_failed = False
@@ -200,6 +194,12 @@ def run_migrate(
         materialized=ctx.inject_result.applied_paths if ctx.inject_result else [],
         exec_result=ctx.exec_result,
     )
+
+    # Save LLM trajectory for this pipeline run
+    from .core.llm import get_trajectory_dict
+    from .core.util import write_json as _wj_traj
+    _traj = get_trajectory_dict(model=cfg.llm.model, endpoint=cfg.llm.base_url)
+    _wj_traj(ctx.run_dir / "trajectory.json", _traj)
 
     return MigrateResult(
         run_dir=ctx.run_dir,

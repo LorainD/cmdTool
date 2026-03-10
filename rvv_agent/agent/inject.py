@@ -174,7 +174,16 @@ def inject_generate_plan(
         action = str(item.get("action", "create")).strip()
         content = str(item.get("content", ""))
         anchor_hint = str(item.get("anchor_hint", ""))
-        if not target_path or not content:
+        if not target_path:
+            continue
+        # Safety: only "create" and "append" are permitted; block any deletion action
+        if action.lower() in ("delete", "replace", "remove", "overwrite"):
+            result.logs.append(InjectionLogEntry(
+                target_path=target_path, action=action, success=False,
+                error=f"action '{action}' blocked: only 'create'/'append' permitted",
+            ))
+            continue
+        if not content:
             continue
         dst = ffmpeg_root / target_path
         try:
@@ -190,6 +199,22 @@ def inject_generate_plan(
         result.logs.append(log)
         if log.success and log.applied_at not in ("dry_run", "skipped_duplicate"):
             result.applied_paths.append(dst)
+
+    # Record inject summary to trajectory
+    try:
+        from ..core.llm import record_trajectory_action  # local to avoid circular
+        inject_summary = ", ".join(
+            f"{e.target_path}@{e.applied_at}"
+            for e in result.logs
+            if e.success and e.applied_at not in ("dry_run", "skipped_duplicate")
+        )
+        record_trajectory_action(
+            "inject",
+            f"Injected {len(result.applied_paths)} file(s) (apply={apply}, attempt={attempt})",
+            detail=inject_summary or "(none)",
+        )
+    except Exception:
+        pass
 
     write_json(apply_dir / "log.json", [
         {"target_path": e.target_path, "action": e.action,
