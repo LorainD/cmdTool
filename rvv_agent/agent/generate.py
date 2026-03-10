@@ -101,14 +101,33 @@ def analyze_with_llm(
     discovery: Discovery,
     *,
     context_override: str | None = None,
+    prior_analysis: dict | None = None,
+    build_errors: str | None = None,
 ) -> AnalysisResult:
+    """调用 LLM 进行算子语义分析。
+
+    Args:
+        cfg: 应用配置。
+        discovery: 符号检索结果。
+        context_override: 用完整函数体替换默认上下文。
+        prior_analysis: 上轮已有分析 JSON（refine 时传入，LLM 可在此基础上修正）。
+        build_errors: 所有历次构建错误文本（帮助 LLM 修正数据类型/指令判断）。
+    """
     ctx = context_override if context_override is not None else build_llm_context(discovery)
     messages = [
         LlmMessage(role="system", content=system_prompt()),
-        LlmMessage(role="user", content=analysis_prompt(discovery.symbol, ctx)),
+        LlmMessage(
+            role="user",
+            content=analysis_prompt(
+                discovery.symbol,
+                ctx,
+                prior_analysis=prior_analysis,
+                build_errors=build_errors,
+            ),
+        ),
     ]
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=1400, stage="analyze")
+        raw = chat_completion(cfg.llm, messages, max_tokens=1600, stage="analyze")
         data = json.loads(raw)
         return AnalysisResult(analysis=data, raw_text=raw, llm_used=True)
     except LlmError as e:
@@ -295,15 +314,36 @@ def fix_generation_with_llm(
     symbol: str,
     build_error: str,
     current_plan: dict,
+    *,
+    analysis: dict | None = None,
+    all_prior_errors: str | None = None,
 ) -> GenerationResult:
-    """Call LLM to fix a failed build; accepts new generate_plan format."""
+    """Call LLM to fix a failed build; accepts new generate_plan format.
+
+    Args:
+        cfg: 应用配置。
+        symbol: 算子名。
+        build_error: 当前这次构建的错误文本。
+        current_plan: 当前生成计划（包含已有文件内容）。
+        analysis: 完整的算子语义分析 JSON（从 DynamicContext 传入，不可省略）。
+        all_prior_errors: 所有历次构建错误的汇总文本（帮助 LLM 避免重复错误）。
+    """
     files_for_prompt = [
         {"path": item.get("target_path", ""), "content": item.get("content", "")}
         for item in current_plan.get("generated", [])
     ]
     messages = [
         LlmMessage(role="system", content=system_prompt()),
-        LlmMessage(role="user", content=build_fix_prompt(symbol, build_error, files_for_prompt)),
+        LlmMessage(
+            role="user",
+            content=build_fix_prompt(
+                symbol,
+                build_error,
+                files_for_prompt,
+                analysis=analysis,
+                all_prior_errors=all_prior_errors,
+            ),
+        ),
     ]
     try:
         raw = chat_completion(cfg.llm, messages, max_tokens=2800, stage="fix")
@@ -324,7 +364,6 @@ def fix_generation_with_llm(
         return GenerationResult(generate_plan=data, raw_text=raw, llm_used=True)
     except Exception as e:
         return GenerationResult(generate_plan=current_plan, raw_text=repr(e), llm_used=False, error=repr(e))
-
 
 def materialize_package(
     run_dir: Path,

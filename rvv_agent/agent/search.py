@@ -146,7 +146,108 @@ def build_llm_context(discovery: Discovery, *, max_lines: int = 160) -> str:
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
-# Context builder from files
+# Intelligent function body extraction helpers
+# ---------------------------------------------------------------------------
+
+_C_FUNC_DEF = re.compile(
+    r"^[a-zA-Z_][a-zA-Z0-9_\s\*]+\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\("
+)
+_ASM_LABEL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*:")
+_ASM_PROC_START = re.compile(
+    r"^\s*(?:func|endfunc|\.globl|SYM_FUNC_START|SYM_FUNC_END|\.proc)\b"
+)
+
+
+def _extract_c_function(lines: list[str], hit_idx: int) -> tuple[int, int]:
+    """提取包含 hit_idx 行的完整 C 函数体（从函数签名到对应的 \'}\'）。
+
+    向上寻找函数定义行（返回类型+函数名+左括号），向下通过花括号计数找到函数结束。
+    返回 (start_idx, end_idx_exclusive) 两个 0-based 行索引。
+    """
+    # ── 向上找函数签名起点 ──────────────────────────────────────────────
+    func_start = hit_idx
+    for i in range(hit_idx, max(-1, hit_idx - 80), -1):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        if "(" in stripped and not stripped.startswith(("if", "while", "for",
+                                                          "switch", "return",
+                                                          "else", "#")):
+            if _C_FUNC_DEF.match(stripped) or (
+                i > 0 and _C_FUNC_DEF.match(lines[i - 1].strip() + " " + stripped)
+            ):
+                func_start = i
+                break
+            if i < hit_idx and re.match(r"^[a-zA-Z_][a-zA-Z0-9_\s\*]*\s*\(", stripped):
+                func_start = i
+                break
+
+    # ── 向下找函数体结束（花括号计数）──────────────────────────────────
+    depth = 0
+    func_end = min(hit_idx + 1, len(lines))
+    found_open = False
+    for i in range(func_start, len(lines)):
+        for ch in lines[i]:
+            if ch == "{":
+                depth += 1
+                found_open = True
+            elif ch == "}":
+                depth -= 1
+        if found_open and depth == 0:
+            func_end = i + 1
+            break
+
+    return func_start, func_end
+
+
+def _extract_asm_procedure(lines: list[str], hit_idx: int) -> tuple[int, int]:
+    """提取包含 hit_idx 行的完整汇编过程（从 func/globl/label 到 endfunc/.size）。
+
+    返回 (start_idx, end_idx_exclusive) 两个 0-based 行索引。
+    """
+    # ── 向上找过程/函数起点 ─────────────────────────────────────────────
+    proc_start = hit_idx
+    for i in range(hit_idx, max(-1, hit_idx - 120), -1):
+        line = lines[i].strip()
+        if _ASM_PROC_START.match(lines[i]) or _ASM_LABEL.match(line):
+            proc_start = i
+            break
+
+    # ── 向下找过程结束（endfunc / .size / 下一个 .globl / 等）──────────
+    proc_end = len(lines)
+    for i in range(hit_idx + 1, len(lines)):
+        line = lines[i].strip()
+        if "endfunc" in line or "SYM_FUNC_END" in line:
+            proc_end = i + 1
+            break
+        if ".size" in line:
+            proc_end = i + 1
+            break
+        if _ASM_LABEL.match(line) and not lines[i].startswith(" ") and i > hit_idx + 2:
+            proc_end = i
+            break
+
+    return proc_start, proc_end
+
+
+def _dedupe_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """合并重叠或相邻的行范围。"""
+    if not ranges:
+        return []
+    sorted_r = sorted(ranges)
+    merged: list[tuple[int, int]] = [sorted_r[0]]
+    for s, e in sorted_r[1:]:
+        ms, me = merged[-1]
+        if s <= me:
+            merged[-1] = (ms, max(me, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Context builder from files — 智能函数体提取版
 # ---------------------------------------------------------------------------
 
 def build_context_from_files(
@@ -154,45 +255,98 @@ def build_context_from_files(
     *,
     symbol: str,
     files: list[str],
-    max_total_chars: int = 20000,
-    window: int = 3,
+    max_total_chars: int = 40000,
+    max_funcs_per_file: int = 6,
 ) -> str:
-    token_re = re.compile(r"\b" + re.escape(symbol) + r"\b")
+    """根据算子/函数名，从指定文件列表中提取相关性最高的完整函数体。
+
+    改进点（相比旧版简单截取头N行）：
+    - **C 文件**：定位包含 symbol 的函数，提取完整函数体（从返回类型到对应 \'}\'）。
+    - **汇编文件**：提取包含 symbol 的完整汇编过程（从 func label 到 endfunc/.size）。
+    - **头文件 / Makefile**：仍取文件头（通常不大），但展示完整内容。
+    - 所有文件内容均带行号，便于 LLM 精确定位。
+    """
+    func_name = symbol.split(".")[-1] if "." in symbol else symbol
+    token_re = re.compile(r"\b" + re.escape(func_name) + r"\b")
+    module = symbol.split(".")[0] if "." in symbol else ""
+    module_re = re.compile(r"\b" + re.escape(module) + r"\b") if module else None
+
     chunks: list[str] = []
     total = 0
+
     for rel in files:
         p = ffmpeg_root / rel
         if not p.exists() or not p.is_file():
             continue
         try:
-            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_text = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        is_asm_file = p.suffix in {".S", ".s", ".asm"}
-        hits: list[int] = (
-            [i for i, line in enumerate(lines) if symbol in line]
-            if is_asm_file
-            else [i for i, line in enumerate(lines) if token_re.search(line)]
-        )
-        if not hits:
-            snippet = "\n".join(lines[: min(40, len(lines))])
-            block = f"--- {rel} (head) ---\n{snippet}\n"
+
+        lines = raw_text.splitlines()
+        suffix = p.suffix.lower()
+        is_asm = suffix in {".s", ".asm"}
+        is_c = suffix in {".c", ".cpp", ".h", ".inc"}
+        is_make = p.name in {"Makefile", "makefile"} or suffix in {".mk", ".mak"}
+
+        if is_make or (not is_asm and not is_c):
+            block_lines = [f"{i+1:5d}: {l}" for i, l in enumerate(lines[:200])]
+            block = f"--- {rel} (full/{len(lines)} lines) ---\n" + "\n".join(block_lines) + "\n"
             chunks.append(block)
             total += len(block)
-        else:
-            for i in hits[:6]:
-                start = max(0, i - window)
-                end = min(len(lines), i + window + 1)
-                snippet = "\n".join(f"{j+1:6d}: {lines[j]}" for j in range(start, end))
-                block = f"--- {rel} (around {symbol} @ line {i+1}) ---\n{snippet}\n"
-                chunks.append(block)
-                total += len(block)
-                if total >= max_total_chars:
-                    break
-        if total >= max_total_chars:
-            break
-    return "\n".join(chunks)[:max_total_chars]
+            continue
 
+        hits: list[int] = []
+        for i, line in enumerate(lines):
+            if token_re.search(line):
+                hits.append(i)
+            elif module_re and module_re.search(line):
+                hits.append(i)
+
+        if not hits:
+            head = lines[:60]
+            block = (
+                f"--- {rel} (no direct match, showing head {len(head)} lines) ---\n"
+                + "\n".join(f"{i+1:5d}: {l}" for i, l in enumerate(head))
+                + "\n"
+            )
+            chunks.append(block)
+            total += len(block)
+            continue
+
+        ranges: list[tuple[int, int]] = []
+        seen_starts: set[int] = set()
+        for hit in hits[:max_funcs_per_file * 3]:
+            if is_asm:
+                s, e = _extract_asm_procedure(lines, hit)
+            else:
+                s, e = _extract_c_function(lines, hit)
+            if s not in seen_starts:
+                seen_starts.add(s)
+                ranges.append((s, e))
+            if len(ranges) >= max_funcs_per_file:
+                break
+
+        merged = _dedupe_ranges(ranges)
+
+        func_blocks: list[str] = []
+        for s, e in merged:
+            func_lines = lines[s:e]
+            snippet = "\n".join(f"{s+i+1:5d}: {l}" for i, l in enumerate(func_lines))
+            func_blocks.append(snippet)
+
+        block = (
+            f"--- {rel} ({len(merged)} function(s) containing \'{func_name}\') ---\n"
+            + "\n\n".join(func_blocks)
+            + "\n"
+        )
+        chunks.append(block)
+        total += len(block)
+
+    result = "\n".join(chunks)
+    if total > max_total_chars:
+        result = result[:max_total_chars]
+    return result
 # ---------------------------------------------------------------------------
 # Retrieval result + LLM-assisted reference selection
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from ..core.prompts import files_refine_prompt, plan_refine_prompt, system_promp
 from .report import write_report
 from .search import select_references
 from ..core.util import ensure_dir, extract_build_errors, fmt_argv, now_id, slug, write_text, print_llm_error, print_red, print_yellow
+from ..core.context import DynamicContext
 
 
 @dataclass
@@ -56,6 +57,15 @@ class SessionContext:
     plans: dict[str, list[str]] = field(default_factory=dict)        # symbol → steps
     ref_files: dict[str, list[str]] = field(default_factory=dict)    # symbol → file list
     refine_history: list[dict] = field(default_factory=list)          # [{stage, feedback}]
+
+    # ── dynamic context per symbol (plan + analysis + build errors, never compressed) ──
+    dynamic_contexts: dict[str, DynamicContext] = field(default_factory=dict)
+
+    def get_dctx(self, symbol: str) -> DynamicContext:
+        """Get or create the DynamicContext for a given symbol."""
+        if symbol not in self.dynamic_contexts:
+            self.dynamic_contexts[symbol] = DynamicContext(symbol=symbol)
+        return self.dynamic_contexts[symbol]
 
 
 # Keep old name as alias so pipeline.py still works without changes
@@ -243,6 +253,9 @@ def run_chat(cfg: AppConfig) -> int:
         # Reset LLM trajectory for this pipeline run
         reset_trajectory()
 
+        # Get/create the DynamicContext for this symbol (carries plan, analysis, build errors)
+        dctx = state.get_dctx(symbol)
+
         # Use cached plan for this symbol if already refined in this session
         if symbol in state.plans:
             plan_steps = state.plans[symbol]
@@ -268,12 +281,13 @@ def run_chat(cfg: AppConfig) -> int:
             print(f"  {i}. {s}")
 
         if not prompt_yes_no("\n确认按该 plan 继续？", default=True):
-            plan_steps = _refine_plan(cfg, symbol, plan_steps, history=state.refine_history)
+            plan_steps = _refine_plan(cfg, symbol, plan_steps, history=dctx.refine_history)
             if not plan_steps:
                 print("已取消，本轮结束👋。\n")
                 continue
             _user_input_lines.append("[plan-refined]")
         state.plans[symbol] = plan_steps
+        dctx.update_plan(plan_steps)  # 同步到 DynamicContext（不可压缩）
         # Update user_input log with any refine feedback
         write_text(run_dir / 'user_input.txt', '\n'.join(_user_input_lines) + '\n')
         from .generate import Plan as _Plan
@@ -316,7 +330,7 @@ def run_chat(cfg: AppConfig) -> int:
                 print(f"  - {_f}")
 
         if not prompt_yes_no("\n确认进入分析/生成阶段？", default=True):
-            selected_files = _refine_files(cfg, symbol, selected_files, history=state.refine_history)
+            selected_files = _refine_files(cfg, symbol, selected_files, history=dctx.refine_history)
             if not selected_files:
                 print("已取消，本轮结束。\n")
                 continue
@@ -329,9 +343,22 @@ def run_chat(cfg: AppConfig) -> int:
 
         ctx = build_context_from_files(ffmpeg_root, symbol=symbol, files=selected_files)
         write_text(run_dir / "context.txt", ctx)
+        dctx.code_context = ctx  # 同步完整代码上下文到 DynamicContext（不截断）
 
         print("\n⚙ 正在分析算子实现…")
-        analysis = analyze_with_llm(cfg, retrieval.discovery, context_override=ctx)
+        # 传入已有分析（refine 时修正）和历次构建错误（不可省略）
+        analysis = analyze_with_llm(
+            cfg,
+            retrieval.discovery,
+            context_override=ctx,
+            prior_analysis=dctx.analysis if dctx.analysis else None,
+            build_errors=dctx.build_errors_for_llm() or None,
+        )
+        # 更新 DynamicContext 中的 analysis（不可压缩）
+        dctx.update_analysis(analysis.analysis, analysis.raw_text)
+        # 落盘到 run_dir/analysis.json
+        from ..core.util import write_json as _wj_a
+        _wj_a(run_dir / "analysis.json", analysis.analysis)
 
         # Build existing_map from selected_files (non-.S files already on disk).
         # selected_files already contains retrieval.existing_rvv, so no extra
@@ -425,7 +452,13 @@ def run_chat(cfg: AppConfig) -> int:
                         print("已取消迭代，本次构建结束。")
                         break
                     print(f"\n正在让 LLM 修复（configure 错误）…")
-                    fix_result = fix_generation_with_llm(cfg, symbol, cfg_err, gen.package)
+                    # 追加构建错误到 DynamicContext（永久保留）
+                    dctx.append_build_error("configure", build_attempt, cfg_err)
+                    fix_result = fix_generation_with_llm(
+                        cfg, symbol, cfg_err, gen.package,
+                        analysis=dctx.analysis or None,
+                        all_prior_errors=dctx.build_errors_for_llm() or None,
+                    )
                     if fix_result.error:
                         print_llm_error(fix_result.error, f"fix/configure#{build_attempt}")
                         print(f"LLM 修复请求失败：{fix_result.error}")
@@ -468,7 +501,13 @@ def run_chat(cfg: AppConfig) -> int:
                     print("已取消迭代，本次构建结束。")
                     break
                 print(f"\n正在让 LLM 修复（make 错误）…")
-                fix_result = fix_generation_with_llm(cfg, symbol, make_err, gen.package)
+                # 追加构建错误到 DynamicContext（永久保留）
+                dctx.append_build_error("make", build_attempt, make_err)
+                fix_result = fix_generation_with_llm(
+                    cfg, symbol, make_err, gen.package,
+                    analysis=dctx.analysis or None,
+                    all_prior_errors=dctx.build_errors_for_llm() or None,
+                )
                 if fix_result.error:
                     print_llm_error(fix_result.error, f"fix/make#{build_attempt}")
                     print(f"LLM 修复请求失败：{fix_result.error}")
@@ -534,6 +573,18 @@ def run_chat(cfg: AppConfig) -> int:
                 state.scp_ok = False
                 state.run_on_board_ok = False
 
+        # Save DynamicContext for this run (includes plan, analysis, build errors)
+        from ..core.util import write_json as _wj_dctx
+        _wj_dctx(run_dir / "dynamic_context.json", {
+            "symbol": dctx.symbol,
+            "plan_steps": dctx.plan_steps,
+            "analysis": dctx.analysis,
+            "build_errors": dctx.build_errors,
+            "refine_history": dctx.refine_history,
+        })
+        print(f"\n[dynamic-context] {dctx.to_summary()}")
+        print(f"  → {run_dir}/dynamic_context.json")
+
         # Save LLM trajectory for this run
         _traj = get_trajectory_dict(
             model=cfg.llm.model,
@@ -559,7 +610,7 @@ def run_chat(cfg: AppConfig) -> int:
             materialized=materialized,
             exec_result=exec_result,
             ref_files=selected_files,
-            refine_history=state.refine_history if state.refine_history else None,
+            refine_history=dctx.refine_history if dctx.refine_history else None,
             interaction={
                 "intent_action": intent.action,
                 "intent_llm_used": intent.llm_used,

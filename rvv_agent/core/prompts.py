@@ -65,39 +65,67 @@ def retrieval_prompt(symbol: str, grouped: dict, matches: list) -> str:
 """
 
 
-def analysis_prompt(symbol: str, context: str) -> str:
+def analysis_prompt(
+    symbol: str,
+    context: str,
+    *,
+    prior_analysis: dict | None = None,
+    build_errors: str | None = None,
+) -> str:
+    """生成算子语义分析 prompt。
+
+    Args:
+        symbol: 要迁移的算子/函数名。
+        context: 从源码提取的相关代码片段（完整函数体）。
+        prior_analysis: 上轮分析 JSON（refine 时传入，LLM 可在此基础上修正）。
+        build_errors: 历次构建错误文本（供 LLM 参考以调整分析）。
+    """
+    prior_section = ""
+    if prior_analysis:
+        import json as _json
+        prior_section = f"""
+# 上轮分析结果（请在此基础上修正，确保字段完整）：
+```json
+{_json.dumps(prior_analysis, ensure_ascii=False, indent=2)}
+```
+"""
+
+    errors_section = ""
+    if build_errors:
+        errors_section = f"""
+# 历次构建错误（参考以修正分析中对数据类型/向量长度/饱和运算等的判断）：
+{build_errors}
+"""
+
     return f"""任务：迁移/生成 {symbol} 的 RVV 优化。
 
-请基于下面的上下文（来自 workspace 的源码片段）输出一个严格 JSON（不要额外文字），字段如下：
+请基于下面的上下文（来自 workspace 的完整函数体源码）输出一个严格 JSON（不要额外文字），字段如下：
 
 {{
-  \"symbol\": \"{symbol}\",
-  \"datatype\": \"float32|float64|int16|int32|int64|uint8|uint16|uint32|mixed\",
-  \"vectorizable\": true|false,
-  \"pattern\": [\"butterfly\", \"horizontal_add\", \"stride_load\", \"saturate\", \"tail\"],
-  \"has_stride\": true|false,
-  \"has_saturation\": true|false,
-  \"reduction\": true|false,
-  \"tail_required\": true|false,
-  \"math_expression\": \"精准数学伪代码，如 dst[i+1]=-dst[i+1] 或 out[i]=a[i]*b[i]\",
-  \"c_candidates\": [\"path:line\", ...],
-  \"x86_refs\": [\"path:line\", ...],   // 优先包含 .S/.asm 实际 SIMD 实现，而非仅 init.c
-  \"arm_refs\": [\"path:line\", ...],   // 同上，NEON .S 文件比 init_arm.c 更重要
-  \"notes\": \"...\"
+  "symbol": "{symbol}",
+  "datatype": "float32|float64|int16|int32|int64|uint8|uint16|uint32|mixed",
+  "vectorizable": true|false,
+  "pattern": ["butterfly", "horizontal_add", "stride_load", "saturate", "tail"],
+  "has_stride": true|false,
+  "has_saturation": true|false,
+  "reduction": true|false,
+  "tail_required": true|false,
+  "math_expression": "精准数学伪代码，如 dst[i+1]=-dst[i+1] 或 out[i]=a[i]*b[i]",
+  "c_candidates": ["path:line", ...],
+  "x86_refs": ["path:line", ...],   // 优先包含 .S/.asm 实际 SIMD 实现，而非仅 init.c
+  "arm_refs": ["path:line", ...],   // 同上，NEON .S 文件比 init_arm.c 更重要
+  "notes": "..."
 }}
 
 注意：
 - datatype 必须推断出具体类型（INTFLOAT 通常为 float32，不要填 unknown）；
 - math_expression 用精准数学伪代码表达核心运算；
-- x86_refs 和 arm_refs 应优先填写含实际 SIMD 指令的 .S / .asm 文件（如 sbrdsp.asm、sbrdsp_neon.S）
-  路径及函数定义行号，而不是仅填 *_init*.c 的行号—— init.c 只有函数指针赋值，
-  .S/.asm 才有可供参考的向量化实现逻辑。
-
-上下文：
+- x86_refs 和 arm_refs 应优先填写含实际 SIMD 指令的 .S / .asm 文件路径及函数定义行号，
+  而不是仅填 *_init*.c 的行号—— init.c 只有函数指针赋值，.S/.asm 才有可供参考的向量化实现逻辑。
+{prior_section}{errors_section}
+上下文（完整函数体，带行号）：
 {context}
 """
-
-
 
 def _number_lines(text: str, max_lines: int = 120) -> str:
     """为文本内容加上行号，便于 LLM 精确定位。"""
@@ -253,18 +281,53 @@ def files_refine_prompt(symbol: str, current_files: list[str], user_feedback: st
 """
 
 
-def build_fix_prompt(symbol: str, build_error: str, generated_files: list[dict]) -> str:
+def build_fix_prompt(
+    symbol: str,
+    build_error: str,
+    generated_files: list[dict],
+    *,
+    analysis: dict | None = None,
+    all_prior_errors: str | None = None,
+) -> str:
+    """生成构建修复 prompt。
+
+    Args:
+        symbol: 算子名。
+        build_error: 当前这次构建的错误文本。
+        generated_files: 已生成的代码文件列表。
+        analysis: 完整的算子语义分析 JSON（从 DynamicContext 传入，不可省略）。
+        all_prior_errors: 所有历次构建错误的汇总文本（帮助 LLM 避免重复错误）。
+    """
+    import json as _json
     files_s = ""
     for f in generated_files[:4]:
         path = f.get("path", "?")
         content = f.get("content", "")[:3000]
         files_s += f"\n--- {path} ---\n{content}\n--- end ---\n"
 
-    return f"""构建 {symbol} 时发生编译错误，请根据编译错误信息对相应的代码进行修改。
+    analysis_section = ""
+    if analysis:
+        analysis_section = f"""
+# 算子语义分析 JSON（请以此为依据修复类型/指令选择等问题）：
+```json
+{_json.dumps(analysis, ensure_ascii=False, indent=2)}
+```
+"""
 
-编译错误信息：
+    history_section = ""
+    if all_prior_errors:
+        history_section = f"""
+# 历次构建错误汇总（避免重复已修复/未修复的问题）：
+{all_prior_errors}
+"""
+
+    return f"""构建 {symbol} 时发生编译错误，请根据编译错误信息对相应的代码进行修改。
+{analysis_section}{history_section}
+# 本次编译错误信息：
 {build_error[:3000]}
 
+# 已生成的文件（参考当前状态）：
+{files_s}
 
 请输出修复后的完整文件，格式为严格 JSON（不要额外文字）：
 {{
@@ -272,4 +335,3 @@ def build_fix_prompt(symbol: str, build_error: str, generated_files: list[dict])
   "patches": [{{"path": "...", "diff": "..."}}, ...]
 }}
 """
-
