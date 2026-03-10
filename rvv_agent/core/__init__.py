@@ -23,3 +23,6 @@ __all__ = [
     "print_llm_error", "print_red", "print_yellow",
     "run_cmd", "run_cmd_stream", "slug", "write_json", "write_text",
 ]
+from .context import MigrationContext
+
+__all__ += ["MigrationContext"]

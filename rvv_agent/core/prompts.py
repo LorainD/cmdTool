@@ -98,44 +98,97 @@ def analysis_prompt(symbol: str, context: str) -> str:
 """
 
 
+
+def _number_lines(text: str, max_lines: int = 120) -> str:
+    """为文本内容加上行号，便于 LLM 精确定位。"""
+    lines = text.splitlines()[:max_lines]
+    return "\n".join(f"{i:4d}: {l}" for i, l in enumerate(lines))
+
+
 def generation_prompt(symbol: str, analysis_json: str, existing_files_map: dict | None = None) -> str:
     existing_section = ""
     if existing_files_map:
-        parts = ["\n以下文件在 FFmpeg workspace 中已存在：\n"]
+        parts = ["\n以下文件在 FFmpeg workspace 中已存在（供参考，勿在 content 字段中输出完整文件）：\n"]
         for path, cnt in existing_files_map.items():
             parts.append(f"--- 已有文件: {path} ---")
             parts.append(cnt[:6000])
             parts.append("--- 文件结束 ---\n")
         existing_section = "\n".join(parts)
 
-    return f"""基于下面的 JSON 分析，生成一个最小可编译的补丁包（不要解释）。
+    return f"""基于下面的 JSON 分析，为 {symbol} 生成 RVV 代码片段（不要解释）。
+
+★★ 核心原则：输出的每个 item 只包含"新增的片段"，不要输出完整已有文件内容。
+   每个 item 的 content 只含本次新增的代码。
 
 要求：
-1) 为 {symbol} 生成 RVV 汇编实现（提供建议的落点路径（例如 libavcodec/riscv/<name>_rvv.S）。
-   ★ 重要：如果ffmpeg中已有该模块的其他算子rvv实现，就将生成的汇编实现补充到已有的*.S文件中，
-   最后输出完整合并后的文件内容（原有内容+新增算子函数）；如果ffmpeg中不存在相关实现，就生成新的.S文件，
-   新增函数需包含完整的汇编指令（.text/.globl/.type/label/.size/ret 等）。只为 {symbol} 生成 RVV 实现。如果对应 .S 文件已存在（见下方"已有文件"），
-   必须把新函数追加到已有文件末尾，绝对不能删除或替换原有函数。
-2) 修改 libav*/riscv/ 下对应的 *init*.c，添加函数注册。
-   *init*.c 必须输出**完整合并后的文件内容**（原有内容 + 新增注册代码）。同时生成init .c 的增量建议（unified diff 或明确片段，只添加新注册项）。
-3) 如果生成了新的.S文件和init文件，需要修改 libav*/riscv/Makefile，添加 .o 条目。绝对不能删除或替换原有内容！
-   Makefile 也必须输出**完整合并后的文件内容**。（如果只是在已有.S文件中新增函数则忽略）。同时生成 Makefile 的增量建议（unified diff 或明确片段）。
-4) 如果 C 源文件没有 riscv 入口，需仿照 x86/arm 格式插入（已有则忽略）。
+1) .S 汇编实现（target_path 示例：libavcodec/riscv/<module>_rvv.S）
+   - 若模块 .S 文件**不存在**：action="create"，content 为完整新 .S 文件
+     （含 .text / .align / .globl / .type / label / .size / ret 等）。
+   - 若模块 .S 文件**已存在**：action="append"，content 仅含新增函数
+     （从 .text 起到最后 .size 结束），不含已有函数。
+2) init.c 注册（target_path 示例：libavcodec/riscv/<module>_init.c）
+   - action="append"，content 仅含新增的赋值语句（1-3 行），
+     如：c_func(ff_xxx) = ff_xxx_rvv;
+   - anchor_hint：指出应插入到哪个函数内的哪个位置，如
+     "在 ff_sbrdsp_init_riscv() 函数内 #if HAVE_RVV 块末尾"。
+3) Makefile（target_path 示例：libavcodec/riscv/Makefile）
+   - 仅当创建了新 .S 文件时输出此 item；若只是在已有 .S 追加函数则忽略。
+   - action="append"，content 仅含新增的 .o 行（1-2 行），
+     如：                        sbrnewfunc_rvv.o \\
+   - anchor_hint：如 "追加到 OBJS-$(CONFIG_AAC_DECODER) 块末尾"。
 
-输出格式必须是严格 JSON（不要额外文字，patches 数组留空）：
-{{
-  "files": [{{"path": "...", "content": "..."}}, ...],
-  "patches": [{{"path": "...", "diff": "..."}}, ...]
-}}
-
-说明：
-- .S 文件 path 示例：libavcodec/riscv/{symbol}_rvv.S（**输出完整合并文件内容**）
-- *init*.c / Makefile：输出完整合并文件内容
+输出格式必须是严格 JSON（不要额外文字）：
+{{{{
+  "generated": [
+    {{{{
+      "target_path": "libavcodec/riscv/...",
+      "action": "create" | "append",
+      "content": "仅新增代码",
+      "anchor_hint": "...",
+      "description": "一句话说明"
+    }}}}
+  ]
+}}}}
 {existing_section}
 analysis_json:
 {analysis_json}
 """
 
+
+def injection_locator_prompt(
+    target_path: str,
+    existing_content: str,
+    snippet: str,
+    anchor_hint: str,
+) -> str:
+    return f"""你是代码注入专家。请根据以下信息，输出严格 JSON，指出应将代码片段
+插入到目标文件的哪一行之后（0-based 行索引）。
+
+目标文件路径：{target_path}
+
+anchor_hint（生成器提供的插入位置提示）：
+{anchor_hint}
+
+待插入代码片段：
+```
+{snippet[:1000]}
+```
+
+目标文件现有内容（含行号）：
+{_number_lines(existing_content, max_lines=120)}
+
+输出 JSON schema（不要额外文字）：
+{{{{
+  "strategy": "insert_after_line" | "append_at_end",
+  "line": <0-based 行索引，若 strategy=append_at_end 则填 -1>,
+  "reason": "一句话说明"
+}}}}
+
+规则：
+- 优先依据 anchor_hint 找到最合适的插入位置。
+- 若无法确定，使用 "append_at_end"。
+- 绝对不要删除或覆盖现有内容。
+"""
 
 
 def plan_prompt(symbol: str) -> str:

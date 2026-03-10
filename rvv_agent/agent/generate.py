@@ -124,25 +124,41 @@ def analyze_with_llm(
 
 @dataclass
 class GenerationResult:
-    package: dict
+    generate_plan: dict
     raw_text: str
     llm_used: bool
     error: str | None = None
 
+    @property
+    def package(self) -> dict:
+        """Backward-compat: wraps generate_plan as old {files, patches} format."""
+        files = [
+            {"path": item.get("target_path", ""), "content": item.get("content", "")}
+            for item in self.generate_plan.get("generated", [])
+        ]
+        return {"files": files, "patches": []}
 
-def _fallback_package(symbol: str) -> dict:
+
+
+def _fallback_plan(symbol: str) -> dict:
     return {
-        "files": [{
-            "path": f"libavcodec/riscv/{symbol}_rvv.S",
-            "content": (
-                "/* TODO: auto-generated placeholder (LLM disabled). */\n"
-                ".text\n.align 2\n"
-                f".globl {symbol}\n.type {symbol}, @function\n"
-                f"{symbol}:\n\tret\n"
-            ),
-        }],
-        "patches": [],
+        "generated": [
+            {
+                "target_path": f"libavcodec/riscv/{symbol}_rvv.S",
+                "action": "create",
+                "content": (
+                    "/* TODO: auto-generated placeholder (LLM disabled). */\n"
+                    ".text\n.align 2\n"
+                    f".globl {symbol}\n.type {symbol}, @function\n"
+                    f"{symbol}:\n\tret\n"
+                ),
+                "anchor_hint": "",
+                "description": "placeholder - LLM disabled",
+            }
+        ],
     }
+
+
 
 
 def _extract_gen_json(raw: str) -> dict:
@@ -159,24 +175,36 @@ def _extract_gen_json(raw: str) -> dict:
     return json.loads(raw)
 
 
-def _has_real_rvv_functions(package: dict) -> bool:
-    """检查生成包中是否含有真实 RVV 实现（非占位符）。"""
+
+def _has_real_rvv_functions(generate_plan: dict) -> bool:
+    """Check whether the generate_plan contains a real RVV implementation.
+
+    Supports both new format {generated:[...]} and legacy {files:[...]}.
+    """
     PLACEHOLDER_MARKERS = ("TODO: auto-generated placeholder", ".globl\n")
     REAL_MARKERS = (
         "vsetvli", "vle", "vse", "vadd", "vsub", "vmul", "vfadd", "vfsub",
         "vfmul", "vfneg", "vmv", "vmerge", "viota", "vid", "vfnmacc",
         "vxor", "vneg", "vand", "vor", "lb\t", "lbu\t", "lh\t", "lw\t",
     )
-    for f in package.get("files", []):
-        path = str(f.get("path", ""))
-        content = str(f.get("content", ""))
+    items = generate_plan.get("generated", [])
+    if not items:
+        items = [
+            {"target_path": f.get("path", ""), "content": f.get("content", "")}
+            for f in generate_plan.get("files", [])
+        ]
+    for item in items:
+        path = str(item.get("target_path", "") or item.get("path", ""))
+        text = str(item.get("content", ""))
         if not path.endswith(".S"):
             continue
-        if any(m in content for m in PLACEHOLDER_MARKERS):
+        if any(m in text for m in PLACEHOLDER_MARKERS):
             return False
-        if any(m in content for m in REAL_MARKERS):
+        if any(m in text for m in REAL_MARKERS):
             return True
     return False
+
+
 
 
 def scan_existing_rvv_content(
@@ -202,7 +230,7 @@ def scan_existing_rvv_content(
             continue
         _read(rel)
 
-    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"
+    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"    #TODO：不止包含codec
     if riscv_dir.is_dir():
         for f in riscv_dir.iterdir():
             if not f.is_file():
@@ -218,6 +246,7 @@ def scan_existing_rvv_content(
     return existing
 
 
+
 def generate_with_llm(
     cfg: AppConfig,
     symbol: str,
@@ -227,41 +256,74 @@ def generate_with_llm(
 ) -> GenerationResult:
     messages = [
         LlmMessage(role="system", content=system_prompt()),
-        LlmMessage(role="user", content=generation_prompt(
-            symbol,
-            json.dumps(analysis_json, ensure_ascii=False),
-            existing_files_map=existing_files_map,
-        )),
+        LlmMessage(
+            role="user",
+            content=generation_prompt(
+                symbol,
+                json.dumps(analysis_json, ensure_ascii=False),
+                existing_files_map=existing_files_map,
+            ),
+        ),
     ]
     try:
         raw = chat_completion(cfg.llm, messages, max_tokens=2800, stage="generate")
         data = _extract_gen_json(raw)
-        return GenerationResult(package=data, raw_text=raw, llm_used=True)
+        # Normalize legacy {files:[...]} format to new {generated:[...]}
+        if "files" in data and "generated" not in data:
+            data = {
+                "generated": [
+                    {
+                        "target_path": f.get("path", ""),
+                        "action": "create",
+                        "content": f.get("content", ""),
+                        "anchor_hint": "",
+                        "description": "",
+                    }
+                    for f in data.get("files", [])
+                ]
+            }
+        return GenerationResult(generate_plan=data, raw_text=raw, llm_used=True)
     except LlmError as e:
-        return GenerationResult(package=_fallback_package(symbol), raw_text=str(e), llm_used=False, error=str(e))
+        return GenerationResult(generate_plan=_fallback_plan(symbol), raw_text=str(e), llm_used=False, error=str(e))
     except Exception as e:
-        return GenerationResult(package=_fallback_package(symbol), raw_text=repr(e), llm_used=False, error=repr(e))
+        return GenerationResult(generate_plan=_fallback_plan(symbol), raw_text=repr(e), llm_used=False, error=repr(e))
+
 
 
 def fix_generation_with_llm(
     cfg: AppConfig,
     symbol: str,
     build_error: str,
-    current_package: dict,
+    current_plan: dict,
 ) -> GenerationResult:
-    """调用 LLM 修复编译失败的代码包。"""
+    """Call LLM to fix a failed build; accepts new generate_plan format."""
+    files_for_prompt = [
+        {"path": item.get("target_path", ""), "content": item.get("content", "")}
+        for item in current_plan.get("generated", [])
+    ]
     messages = [
         LlmMessage(role="system", content=system_prompt()),
-        LlmMessage(role="user", content=build_fix_prompt(
-            symbol, build_error, current_package.get("files", []),
-        )),
+        LlmMessage(role="user", content=build_fix_prompt(symbol, build_error, files_for_prompt)),
     ]
     try:
         raw = chat_completion(cfg.llm, messages, max_tokens=2800, stage="fix")
         data = _extract_gen_json(raw)
-        return GenerationResult(package=data, raw_text=raw, llm_used=True)
+        if "files" in data and "generated" not in data:
+            data = {
+                "generated": [
+                    {
+                        "target_path": f.get("path", ""),
+                        "action": "create",
+                        "content": f.get("content", ""),
+                        "anchor_hint": "",
+                        "description": "(fix attempt)",
+                    }
+                    for f in data.get("files", [])
+                ]
+            }
+        return GenerationResult(generate_plan=data, raw_text=raw, llm_used=True)
     except Exception as e:
-        return GenerationResult(package=current_package, raw_text=repr(e), llm_used=False, error=repr(e))
+        return GenerationResult(generate_plan=current_plan, raw_text=repr(e), llm_used=False, error=repr(e))
 
 
 def materialize_package(
@@ -325,3 +387,67 @@ def materialize_package(
                     result.stdout + result.stderr,
                 )
     return out_paths
+
+
+def save_generate_folder(
+    run_dir: Path,
+    generate_plan: dict,
+    attempt: int = 0,
+) -> Path:
+    """Save generate_plan to run_dir/generate[_fixN]/ for debugging.
+
+    Layout:
+        generate/
+            plan.json       -- full plan JSON
+            files/
+                <basename>  -- individual file contents
+    """
+    suffix = f"_fix{attempt}" if attempt > 0 else ""
+    gen_dir = run_dir / f"generate{suffix}"
+    ensure_dir(gen_dir)
+    write_json(gen_dir / "plan.json", generate_plan)
+    files_dir = gen_dir / "files"
+    ensure_dir(files_dir)
+    for item in generate_plan.get("generated", []):
+        rel = Path(str(item.get("target_path", ""))).name
+        txt = str(item.get("content", ""))
+        if rel and txt:
+            write_text(files_dir / rel, txt)
+    return gen_dir
+
+
+# ---------------------------------------------------------------------------
+# Context-aware stage wrappers
+# ---------------------------------------------------------------------------
+
+def analyze(ctx: "MigrationContext") -> "MigrationContext":
+    """Context-aware analysis stage.
+
+    Calls :func:`analyze_with_llm` using ``ctx.discovery`` and stores
+    the result back into *ctx*.
+
+    Updates
+    -------
+    ``ctx.analysis_result`` — full :class:`AnalysisResult`.
+    """
+    result = analyze_with_llm(ctx.cfg, ctx.discovery)
+    ctx.analysis_result = result
+    return ctx
+
+
+def generate(ctx: "MigrationContext") -> "MigrationContext":
+    """Context-aware generation stage.
+
+    Calls :func:`generate_with_llm` using the analysis stored in *ctx* and
+    saves generated files to ``ctx.run_dir/generate/``.
+
+    Updates
+    -------
+    ``ctx.current_gen`` — :class:`GenerationResult` from the LLM.
+    """
+    analysis_text = ctx.analysis_result.analysis if ctx.analysis_result else ""
+    gen = generate_with_llm(ctx.cfg, ctx.operator, analysis_text)
+    ctx.current_gen = gen
+    if ctx.run_dir is not None:
+        save_generate_folder(ctx.run_dir, gen.generate_plan)
+    return ctx

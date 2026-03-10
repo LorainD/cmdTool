@@ -2,24 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-from .agent.generate import AnalysisResult, analyze_with_llm
-from .core.config import AppConfig
-from .tool.exec import ExecResult, run_configure, run_make_checkasm
 from .agent.generate import (
+    AnalysisResult,
     GenerationResult,
+    analyze as analyze_stage,
     fix_generation_with_llm,
-    generate_with_llm,
-    materialize_package,
+    generate as generate_stage,
+    save_generate_folder,
+    _has_real_rvv_functions,
+    fixed_plan,
 )
-from .agent.generate import fixed_plan
+from .agent.inject import InjectResult, inject_generate_plan, insert as insert_stage
 from .agent.report import write_report
-from .agent.search import Discovery, find_symbol
+from .agent.search import Discovery, find_symbol, search as search_stage
+from .core.config import AppConfig
+from .core.context import MigrationContext
 from .core.util import ensure_dir, now_id, slug, write_text
+from .tool.exec import ExecResult, run_configure, run_make_checkasm
 
 
-# Maximum number of LLM-fix attempts after a configure/build error
 _MAX_FIX_ATTEMPTS = 3
 
 
@@ -31,33 +33,6 @@ class MigrateResult:
     exec_summary: str
 
 
-def _has_real_rvv_functions(package: dict) -> bool:
-    """Return True only if the generated package contains at least one .S file
-    with what appears to be a real RVV implementation (not just a placeholder).
-
-    Heuristics:
-    - Has at least one 'files' entry whose path ends in .S
-    - That file's content contains a real instruction or RVV intrinsic
-      (not just ret/nop or the fallback TODO comment)
-    """
-    PLACEHOLDER_MARKERS = ("TODO: auto-generated placeholder", ".globl\n")
-    REAL_MARKERS = (
-        "vsetvli", "vle", "vse", "vadd", "vsub", "vmul", "vfadd", "vfsub",
-        "vfmul", "vfneg", "vmv", "vmerge", "viota", "vid", "vfnmacc",
-        "vxor", "vneg", "vand", "vor", "lb\t", "lbu\t", "lh\t", "lw\t",
-    )
-    for f in package.get("files", []):
-        path = str(f.get("path", ""))
-        content = str(f.get("content", ""))
-        if not path.endswith(".S"):
-            continue
-        if any(m in content for m in PLACEHOLDER_MARKERS):
-            return False
-        if any(m in content for m in REAL_MARKERS):
-            return True
-    return False
-
-
 def run_migrate(
     cfg: AppConfig,
     *,
@@ -67,153 +42,167 @@ def run_migrate(
     jobs: int,
     apply: bool,
 ) -> MigrateResult:
-    run_dir = Path("runs") / f"{now_id()}_{slug(symbol)}"
-    ensure_dir(run_dir)
+    """Two-stage migration pipeline.
+
+    Stage 1 — Generator LLM
+        Produces code snippets (only new code) saved under run_dir/generate/.
+
+    Stage 2 — Injector (+ optional Locator LLM for init.c / Makefile)
+        Reads run_dir/generate/plan.json and applies safe append/create to
+        the FFmpeg workspace.  Results logged under run_dir/apply/.
+    """
+    # ── Initialise context ────────────────────────────────────────────────
+    ctx = MigrationContext(
+        operator=symbol,
+        repo_root=ffmpeg_root,
+        cfg=cfg,
+        do_exec=do_exec,
+        apply=apply,
+        jobs=jobs,
+    )
+    ctx.run_dir = Path("runs") / f"{now_id()}_{slug(symbol)}"
+    ensure_dir(ctx.run_dir)
 
     plan = fixed_plan(symbol)
 
-    discovery: Discovery = find_symbol(ffmpeg_root, symbol)
+    # ── Stage: Search (locate symbol in the source tree) ──────────────────
+    ctx = search_stage(ctx)
 
-    analysis: AnalysisResult = analyze_with_llm(cfg, discovery)
+    # ── Stage: Analyze (LLM semantic analysis) ────────────────────────────
+    ctx = analyze_stage(ctx)
 
-    gen: GenerationResult = generate_with_llm(cfg, symbol, analysis.analysis)
+    # ── Stage: Generate (LLM code generation) ─────────────────────────────
+    ctx = generate_stage(ctx)
 
-    # ── Validate that real RVV functions were generated ────────────────────
-    # If only a fallback placeholder was produced, record a warning and skip
-    # the build step rather than calling the compiler with a stub.
-    generation_valid = gen.llm_used and _has_real_rvv_functions(gen.package)
+    gen = ctx.current_gen
+    generation_valid = gen.llm_used and _has_real_rvv_functions(gen.generate_plan)
+
     if not generation_valid:
-        # Save the raw LLM output / error for inspection
-        write_text(run_dir / "generate_raw.txt", gen.raw_text or "(empty)")
-        if not gen.llm_used:
-            write_text(
-                run_dir / "generate_error.txt",
-                f"LLM was not used (fallback). error={gen.error}",
-            )
-        else:
-            write_text(
-                run_dir / "generate_error.txt",
-                "LLM responded but no real RVV functions found in output.",
-            )
+        write_text(ctx.run_dir / "generate_raw.txt", gen.raw_text or "(empty)")
+        write_text(
+            ctx.run_dir / "generate_error.txt",
+            f"LLM was not used (fallback). error={gen.error}"
+            if not gen.llm_used
+            else "LLM responded but no real RVV functions found in output.",
+        )
 
-    materialized = materialize_package(
-        run_dir, ffmpeg_root, gen.package, apply=apply and generation_valid
-    )
+    # ── Stage: Inject (apply generated code to workspace) ─────────────────
+    ctx = insert_stage(ctx)
 
-    exec_result = ExecResult()
+    # ── Stage: Build + LLM fix loops ──────────────────────────────────────
+    ctx.exec_result = ExecResult()
     exec_failed = False
     exec_summary = ""
 
     if do_exec and generation_valid:
         build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
         ensure_dir(build_dir)
-        exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
+        ctx.exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
 
-        if exec_result.configure.returncode != 0:
+        if ctx.exec_result.configure.returncode != 0:
             exec_failed = True
-            configure_error = (
-                (exec_result.configure.stdout or "")
-                + (exec_result.configure.stderr or "")
+            ctx.build_log = (
+                (ctx.exec_result.configure.stdout or "")
+                + (ctx.exec_result.configure.stderr or "")
             )
             # ── LLM-fix loop on configure failure ─────────────────────────
-            current_gen = gen
             for attempt in range(1, _MAX_FIX_ATTEMPTS + 1):
                 write_text(
-                    run_dir / f"fix_attempt{attempt}_configure_raw.txt",
-                    configure_error,
+                    ctx.run_dir / f"fix_attempt{attempt}_configure_error.txt",
+                    ctx.build_log,
                 )
                 fixed_gen = fix_generation_with_llm(
-                    cfg,
-                    symbol,
-                    build_error=configure_error,
-                    current_package=current_gen.package,
+                    cfg, symbol,
+                    build_error=ctx.build_log,
+                    current_plan=ctx.current_gen.generate_plan,
                 )
                 write_text(
-                    run_dir / f"fix_attempt{attempt}_generate_raw.txt",
+                    ctx.run_dir / f"fix_attempt{attempt}_generate_raw.txt",
                     fixed_gen.raw_text,
                 )
-                if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.package):
-                    break  # LLM couldn't help
-                materialize_package(
-                    run_dir, ffmpeg_root, fixed_gen.package,
-                    apply=apply, attempt=attempt,
-                )
-                exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
-                if exec_result.configure.returncode == 0:
-                    exec_failed = False
-                    current_gen = fixed_gen
+                if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.generate_plan):
                     break
-                configure_error = (
-                    (exec_result.configure.stdout or "")
-                    + (exec_result.configure.stderr or "")
+                ctx.current_gen = fixed_gen
+                save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
+                inject_generate_plan(
+                    ctx.run_dir, ffmpeg_root, fixed_gen.generate_plan,
+                    apply=apply, attempt=attempt, cfg=cfg,
                 )
-                current_gen = fixed_gen
+                ctx.exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
+                if ctx.exec_result.configure.returncode == 0:
+                    exec_failed = False
+                    break
+                ctx.build_log = (
+                    (ctx.exec_result.configure.stdout or "")
+                    + (ctx.exec_result.configure.stderr or "")
+                )
 
-        if exec_result.configure is not None and exec_result.configure.returncode == 0:
-            build_error_for_fix = ""
-            exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
-            if exec_result.make_checkasm.returncode != 0:
+        if ctx.exec_result.configure is not None and ctx.exec_result.configure.returncode == 0:
+            ctx.exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
+            if ctx.exec_result.make_checkasm.returncode != 0:
                 exec_failed = True
-                build_error_for_fix = (
-                    (exec_result.make_checkasm.stdout or "")
-                    + (exec_result.make_checkasm.stderr or "")
+                ctx.build_log = (
+                    (ctx.exec_result.make_checkasm.stdout or "")
+                    + (ctx.exec_result.make_checkasm.stderr or "")
                 )
-                # ── LLM-fix loop on build (make checkasm) failure ──────────
-                current_gen = gen
+                ctx.checkasm_output = ctx.build_log
+                # ── LLM-fix loop on make checkasm failure ──────────────────
                 for attempt in range(1, _MAX_FIX_ATTEMPTS + 1):
                     write_text(
-                        run_dir / f"fix_attempt{attempt}_build_raw.txt",
-                        build_error_for_fix,
+                        ctx.run_dir / f"fix_attempt{attempt}_build_error.txt",
+                        ctx.build_log,
                     )
                     fixed_gen = fix_generation_with_llm(
-                        cfg,
-                        symbol,
-                        build_error=build_error_for_fix,
-                        current_package=current_gen.package,
+                        cfg, symbol,
+                        build_error=ctx.build_log,
+                        current_plan=ctx.current_gen.generate_plan,
                     )
                     write_text(
-                        run_dir / f"fix_attempt{attempt}_generate_raw.txt",
+                        ctx.run_dir / f"fix_attempt{attempt}_generate_raw.txt",
                         fixed_gen.raw_text,
                     )
-                    if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.package):
+                    if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.generate_plan):
                         break
-                    materialize_package(
-                        run_dir, ffmpeg_root, fixed_gen.package,
-                        apply=apply, attempt=attempt,
+                    ctx.current_gen = fixed_gen
+                    save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
+                    inject_generate_plan(
+                        ctx.run_dir, ffmpeg_root, fixed_gen.generate_plan,
+                        apply=apply, attempt=attempt, cfg=cfg,
                     )
-                    exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
-                    if exec_result.make_checkasm.returncode == 0:
+                    ctx.exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
+                    if ctx.exec_result.make_checkasm.returncode == 0:
                         exec_failed = False
+                        ctx.checkasm_output = (
+                            (ctx.exec_result.make_checkasm.stdout or "")
+                            + (ctx.exec_result.make_checkasm.stderr or "")
+                        )
                         break
-                    build_error_for_fix = (
-                        (exec_result.make_checkasm.stdout or "")
-                        + (exec_result.make_checkasm.stderr or "")
+                    ctx.build_log = (
+                        (ctx.exec_result.make_checkasm.stdout or "")
+                        + (ctx.exec_result.make_checkasm.stderr or "")
                     )
-                    current_gen = fixed_gen
-        elif exec_result.make_checkasm is None:
-            # configure never succeeded – skip checkasm
-            pass
+                    ctx.checkasm_output = ctx.build_log
 
         exec_summary = (
             f"generation_valid={generation_valid} "
-            f"configure_rc={exec_result.configure.returncode if exec_result.configure else 'skipped'} "
-            f"checkasm_build_rc={exec_result.make_checkasm.returncode if exec_result.make_checkasm else 'skipped'}"
+            f"configure_rc={ctx.exec_result.configure.returncode if ctx.exec_result.configure else 'skipped'} "
+            f"checkasm_build_rc={ctx.exec_result.make_checkasm.returncode if ctx.exec_result.make_checkasm else 'skipped'}"
         )
     elif not generation_valid:
         exec_summary = "skipped_build: no real RVV functions generated"
 
     report_path = write_report(
-        run_dir,
+        ctx.run_dir,
         plan=plan,
-        discovery=discovery,
-        analysis=analysis,
-        generation_raw=gen.raw_text,
-        materialized=materialized,
-        exec_result=exec_result,
+        discovery=ctx.discovery,
+        analysis=ctx.analysis_result,
+        generation_raw=ctx.current_gen.raw_text if ctx.current_gen else "",
+        materialized=ctx.inject_result.applied_paths if ctx.inject_result else [],
+        exec_result=ctx.exec_result,
     )
 
     return MigrateResult(
-        run_dir=run_dir,
+        run_dir=ctx.run_dir,
         report_path=report_path,
         exec_failed=exec_failed,
         exec_summary=exec_summary,

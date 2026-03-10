@@ -286,3 +286,25 @@ def select_references(
         fb = _fallback_selection(discovery)
         return RetrievalResult(discovery=discovery, selected=fb, raw_text=repr(e),
                                llm_used=False, error=repr(e), existing_rvv=existing_rvv)
+
+
+# ---------------------------------------------------------------------------
+# Context-aware stage wrapper
+# ---------------------------------------------------------------------------
+
+def search(ctx: "MigrationContext") -> "MigrationContext":
+    """Context-aware search stage.
+
+    Runs :func:`find_symbol` on ``ctx.operator`` / ``ctx.repo_root`` and
+    stores results back into *ctx*.
+
+    Updates
+    -------
+    ``ctx.discovery``   — full :class:`Discovery` result.
+    ``ctx.source_file`` — primary source file path (first match, if any).
+    """
+    disc = find_symbol(ctx.repo_root, ctx.operator)
+    ctx.discovery = disc
+    if disc.matches:
+        ctx.source_file = disc.matches[0].file
+    return ctx
