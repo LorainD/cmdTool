@@ -1,0 +1,135 @@
+"""core.prompts_patch — Prompt templates for PATCH and DEBUG stages.
+
+Separated from core/prompts.py to keep the original prompts untouched
+(pipeline mode still uses them).
+"""
+from __future__ import annotations
+
+import json
+
+
+def patch_locate_prompt(
+    symbol: str,
+    analysis_json: dict,
+    selected_files: list[str],
+    code_context: str,
+) -> str:
+    """Prompt for Step 1: locate precise patch points."""
+    return f"""你是 FFmpeg RVV 迁移专家。
+
+目标算子: {symbol}
+
+## 语义分析
+{json.dumps(analysis_json, ensure_ascii=False, indent=2)}
+
+## 参考文件列表
+{json.dumps(selected_files, ensure_ascii=False)}
+
+## 代码上下文
+{code_context[:6000]}
+
+## 任务
+分析上述信息，确定需要修改/创建的文件及精确插入位置。
+
+对每个需要变更的文件，输出:
+- file: 相对路径
+- line: 插入行号（0-based，-1 表示新建文件或追加到末尾）
+- rationale: 为什么在这里插入
+
+严格输出 JSON:
+{{"patch_points": [{{"file": "...", "line": -1, "rationale": "..."}}]}}"""
+
+
+def patch_design_prompt(
+    symbol: str,
+    analysis_json: dict,
+    patch_points: list[dict],
+    kb_patterns: list[dict] | None = None,
+) -> str:
+    """Prompt for Step 2: design the patch (what to change, not the code)."""
+    # --- PLACEHOLDER_DESIGN ---
+    kb_section = ""
+    if kb_patterns:
+        kb_section = f"\n## 知识库中的相关模式\n{json.dumps(kb_patterns, ensure_ascii=False, indent=2)}"
+
+    return f"""你是 FFmpeg RVV 迁移专家。
+
+目标算子: {symbol}
+
+## 语义分析
+{json.dumps(analysis_json, ensure_ascii=False, indent=2)}
+
+## 锚点定位结果
+{json.dumps(patch_points, ensure_ascii=False, indent=2)}
+{kb_section}
+
+## 任务
+基于以上信息，设计变更方案。对每个变更点，说明:
+- type: "create_file" | "append_function" | "inject_code" | "add_build_rule"
+- file: 目标文件路径
+- description: 变更内容描述
+- code_items: 需要生成的代码项列表（函数名/宏名/规则名）
+
+同时给出整体 rationale。
+
+严格输出 JSON:
+{{"changes": [{{"type": "...", "file": "...", "description": "...", "code_items": [...]}}], "rationale": "..."}}"""
+
+
+def patch_generate_prompt(
+    symbol: str,
+    analysis_json: dict,
+    design: dict,
+    existing_files_map: dict[str, str] | None = None,
+) -> str:
+    """Prompt for Step 3: generate actual code based on design."""
+    existing_section = ""
+    if existing_files_map:
+        parts = []
+        for path, content in existing_files_map.items():
+            parts.append(f"### {path}\n```\n{content[:3000]}\n```")
+        existing_section = "\n## 现有文件内容（需要做增量合并）\n" + "\n".join(parts)
+
+    return f"""你是 FFmpeg RVV 迁移专家。请根据变更设计生成完整代码。
+
+目标算子: {symbol}
+
+## 语义分析
+{json.dumps(analysis_json, ensure_ascii=False, indent=2)}
+
+## 变更设计
+{json.dumps(design, ensure_ascii=False, indent=2)}
+{existing_section}
+
+## 要求
+1. .S 文件：使用 RISC-V Vector (RVV) 汇编，遵循 FFmpeg 汇编风格
+2. init.c 文件：注册 RVV 实现到 DSP context
+3. Makefile：添加新文件到编译单元
+4. 对已有文件做增量修改（不要重写整个文件，只输出需要添加的代码片段）
+
+严格输出 JSON:
+{{"generated": [{{"target_path": "...", "action": "create"|"append"|"inject", "content": "...", "anchor_hint": "...", "description": "..."}}]}}"""
+
+
+def debug_classify_prompt(error_text: str, current_patch: dict | None = None) -> str:
+    """Prompt for DEBUG stage: classify error and suggest rollback target."""
+    patch_section = ""
+    if current_patch:
+        patch_section = f"\n## 当前 Patch 信息\n{json.dumps(current_patch, ensure_ascii=False, indent=2)[:3000]}"
+
+    return f"""你是构建错误诊断专家。
+
+## 构建错误
+{error_text[:4000]}
+{patch_section}
+
+## 任务
+1. 将错误分类为: compile_error | link_error | runtime_error | test_mismatch
+2. 确定回滚目标:
+   - "locate": 锚点漂移或 patch 应用位置错误
+   - "design": 构建系统问题（Makefile 未添加文件、缺少头文件包含等）
+   - "generate": 代码本身有语法/逻辑错误
+3. 给出具体修复建议
+
+严格输出 JSON:
+{{"error_class": "...", "rollback_target": "...", "fix_actions": ["..."], "suggestion": "..."}}"""

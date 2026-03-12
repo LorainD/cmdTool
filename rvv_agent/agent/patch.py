@@ -1,0 +1,424 @@
+"""agent.patch — 4-step PATCH stage for the state-machine pipeline.
+
+Replaces the old generate+inject flow with a structured sequence:
+  1. locate_patch_points  — LLM finds precise insertion anchors
+  2. design_patch         — LLM decides *what* to change
+  3. generate_code        — LLM produces the actual code
+  4. apply_patch          — tool writes code to repo, records diffs
+
+Core injection helpers are imported from agent/inject.py (shared with
+pipeline mode).  Code generation JSON parsing is imported from
+agent/generate.py.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from ..core.config import AppConfig
+from ..core.llm import LlmError, LlmMessage, chat_completion, record_trajectory_action
+from ..core.prompts import system_prompt
+from ..core.prompts_patch import (
+    patch_design_prompt,
+    patch_generate_prompt,
+    patch_locate_prompt,
+)
+from ..core.task import (
+    PatchArtifact,
+    PatchDesign,
+    PatchPoint,
+    TaskContext,
+    TaskState,
+)
+from ..core.util import ensure_dir, now_id, write_json, write_text
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers (re-exported from generate.py / inject.py)
+# ---------------------------------------------------------------------------
+
+def _extract_gen_json(raw: str) -> dict:
+    """Extract JSON from LLM response (handles markdown fences)."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        if raw.endswith("```"):
+            raw = raw.rsplit("```", 1)[0]
+        raw = raw.strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(raw[start: end + 1])
+    return json.loads(raw)
+
+
+def _snippet_already_present(existing: str, snippet: str) -> bool:
+    """Check if the meaningful lines of snippet are already in existing."""
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("//", "/*", "#", ";")):
+            return stripped in existing
+    return False
+
+
+def _snapshot(apply_dir: Path, src_file: Path) -> None:
+    """Save a copy of src_file into apply_dir/snapshot/."""
+    try:
+        snap_dir = apply_dir / "snapshot"
+        parts = src_file.parts
+        rel = Path(*parts[-3:]) if len(parts) >= 3 else Path(src_file.name)
+        snap = snap_dir / rel
+        ensure_dir(snap.parent)
+        write_text(snap, src_file.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        pass
+
+
+def _inject_asm_file(dst: Path, content: str, apply_dir: Path) -> dict:
+    """Inject content into a .S file (create or append)."""
+    rel = str(dst)
+    if not dst.exists():
+        ensure_dir(dst.parent)
+        write_text(dst, content)
+        _snapshot(apply_dir, dst)
+        return {"target_path": rel, "action": "create", "applied_at": "new_file", "success": True}
+    existing = dst.read_text(encoding="utf-8", errors="replace")
+    if _snippet_already_present(existing, content):
+        return {"target_path": rel, "action": "append", "applied_at": "skipped_duplicate", "success": True}
+    merged = existing.rstrip("\n") + "\n\n" + content.lstrip("\n")
+    write_text(dst, merged)
+    _snapshot(apply_dir, dst)
+    return {"target_path": rel, "action": "append", "applied_at": "end", "success": True}
+
+
+def _inject_text_file(dst: Path, content: str, anchor_hint: str,
+                       apply_dir: Path, cfg: AppConfig | None) -> dict:
+    """Inject content into a .c/.h/Makefile (create, or LLM-located insert)."""
+    rel = str(dst)
+    if not dst.exists():
+        ensure_dir(dst.parent)
+        write_text(dst, content)
+        _snapshot(apply_dir, dst)
+        return {"target_path": rel, "action": "create", "applied_at": "new_file", "success": True}
+    existing = dst.read_text(encoding="utf-8", errors="replace")
+    if _snippet_already_present(existing, content):
+        return {"target_path": rel, "action": "append", "applied_at": "skipped_duplicate", "success": True}
+
+    insert_after = -1
+    applied_at = "end"
+    if cfg is not None and anchor_hint:
+        try:
+            insert_after = _locate_insertion_line_llm(cfg, rel, existing, content, anchor_hint)
+        except Exception:
+            insert_after = -1
+    if insert_after >= 0:
+        lines = existing.splitlines(keepends=True)
+        pos = min(insert_after + 1, len(lines))
+        inject = content.lstrip("\n")
+        if not inject.endswith("\n"):
+            inject += "\n"
+        lines.insert(pos, inject)
+        new_content = "".join(lines)
+        applied_at = f"line:{insert_after}"
+    else:
+        new_content = existing.rstrip("\n") + "\n" + content.lstrip("\n")
+    write_text(dst, new_content)
+    _snapshot(apply_dir, dst)
+    return {"target_path": rel, "action": "inject", "applied_at": applied_at, "success": True}
+
+
+def _locate_insertion_line_llm(cfg: AppConfig, target_path: str,
+                                existing_content: str, snippet: str,
+                                anchor_hint: str) -> int:
+    """Call Locator LLM to find 0-based line to insert after. Returns -1 for end."""
+    from ..core.prompts import injection_locator_prompt
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=injection_locator_prompt(
+            target_path=target_path,
+            existing_content=existing_content,
+            snippet=snippet,
+            anchor_hint=anchor_hint,
+        )),
+    ]
+    try:
+        raw = chat_completion(cfg.llm, messages, max_tokens=300, stage="patch_locate_line")
+        raw = raw.strip()
+        s = raw.find("{")
+        e = raw.rfind("}")
+        data = json.loads(raw[s:e + 1]) if s != -1 and e > s else json.loads(raw)
+        if data.get("strategy") == "insert_after_line":
+            return int(data.get("line", -1))
+        return -1
+    except Exception:
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Locate patch points
+# ---------------------------------------------------------------------------
+
+def locate_patch_points(task: TaskContext) -> list[PatchPoint]:
+    """LLM determines precise insertion anchors for the migration."""
+    retrieval = task.load_artifact("RETRIEVE")
+    analysis = task.load_artifact("ANALYZE")
+
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=patch_locate_prompt(
+            symbol=task.target.symbol,
+            analysis_json=analysis.get("analysis_json", {}),
+            selected_files=retrieval.get("selected_files", []),
+            code_context=retrieval.get("code_context", ""),
+        )),
+    ]
+    try:
+        raw = chat_completion(task.cfg.llm, messages, max_tokens=1200, stage="patch_locate")
+        data = _extract_gen_json(raw)
+        points = []
+        for pp in data.get("patch_points", []):
+            points.append(PatchPoint(
+                file=str(pp.get("file", "")),
+                line=int(pp.get("line", -1)),
+                surrounding_hash=hashlib.md5(
+                    str(pp.get("file", "")).encode()
+                ).hexdigest()[:8],
+                rationale=str(pp.get("rationale", "")),
+            ))
+        record_trajectory_action("patch_locate", f"Located {len(points)} patch points")
+        return points
+    except (LlmError, Exception) as e:
+        print(f"[patch] locate failed: {e}, using fallback")
+        return [PatchPoint(
+            file=f"libavcodec/riscv/{task.target.module}_rvv.S",
+            line=-1,
+            rationale="fallback: new RVV assembly file",
+        )]
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Design patch
+# ---------------------------------------------------------------------------
+
+def design_patch(task: TaskContext, points: list[PatchPoint],
+                 kb_patterns: list[dict] | None = None) -> PatchDesign:
+    """LLM decides what changes to make (without generating code yet)."""
+    analysis = task.load_artifact("ANALYZE")
+
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=patch_design_prompt(
+            symbol=task.target.symbol,
+            analysis_json=analysis.get("analysis_json", {}),
+            patch_points=[asdict(p) for p in points],
+            kb_patterns=kb_patterns,
+        )),
+    ]
+    try:
+        raw = chat_completion(task.cfg.llm, messages, max_tokens=1200, stage="patch_design")
+        data = _extract_gen_json(raw)
+        design = PatchDesign(
+            changes=data.get("changes", []),
+            rationale=data.get("rationale", ""),
+        )
+        record_trajectory_action("patch_design", f"Designed {len(design.changes)} changes")
+        return design
+    except (LlmError, Exception) as e:
+        print(f"[patch] design failed: {e}, using fallback")
+        return PatchDesign(
+            changes=[{
+                "type": "create_file",
+                "file": f"libavcodec/riscv/{task.target.module}_rvv.S",
+                "description": "RVV assembly implementation",
+                "code_items": [task.target.symbol],
+            }],
+            rationale="fallback design",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Generate code
+# ---------------------------------------------------------------------------
+
+def generate_code(task: TaskContext, design: PatchDesign) -> dict:
+    """LLM generates actual code based on the design. Returns generate_plan dict."""
+    analysis = task.load_artifact("ANALYZE")
+    retrieval = task.load_artifact("RETRIEVE")
+
+    # Build existing_files_map for incremental merge
+    existing_map: dict[str, str] = {}
+    for rel in retrieval.get("selected_files", []):
+        full = task.ffmpeg_root / rel
+        if full.exists() and full.is_file() and not rel.endswith(".S"):
+            try:
+                existing_map[rel] = full.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=patch_generate_prompt(
+            symbol=task.target.symbol,
+            analysis_json=analysis.get("analysis_json", {}),
+            design=asdict(design),
+            existing_files_map=existing_map or None,
+        )),
+    ]
+    try:
+        raw = chat_completion(task.cfg.llm, messages, max_tokens=2800, stage="patch_generate")
+        data = _extract_gen_json(raw)
+        # Normalize legacy format
+        if "files" in data and "generated" not in data:
+            data = {
+                "generated": [
+                    {
+                        "target_path": f.get("path", ""),
+                        "action": "create",
+                        "content": f.get("content", ""),
+                        "anchor_hint": "",
+                        "description": "",
+                    }
+                    for f in data.get("files", [])
+                ]
+            }
+        record_trajectory_action(
+            "patch_generate",
+            f"Generated {len(data.get('generated', []))} files",
+        )
+        return data
+    except (LlmError, Exception) as e:
+        print(f"[patch] generate failed: {e}, using placeholder")
+        return {
+            "generated": [{
+                "target_path": f"libavcodec/riscv/{task.target.module}_rvv.S",
+                "action": "create",
+                "content": (
+                    f"/* TODO: placeholder (LLM failed: {e}) */\n"
+                    ".text\n.align 2\n"
+                    f".globl {task.target.symbol}\n"
+                    f".type {task.target.symbol}, @function\n"
+                    f"{task.target.symbol}:\n\tret\n"
+                ),
+                "anchor_hint": "",
+                "description": "placeholder",
+            }]
+        }
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Apply patch
+# ---------------------------------------------------------------------------
+
+def apply_patch(task: TaskContext, generate_plan: dict) -> PatchArtifact:
+    """Write generated code to the FFmpeg repo, record diffs and snapshots."""
+    apply_ok = True
+    if task.cfg and task.cfg.human.apply_ok is not None:
+        apply_ok = task.cfg.human.apply_ok
+
+    patch_id = now_id()
+    apply_dir = task.run_dir / f"apply_{patch_id}"
+    ensure_dir(apply_dir)
+
+    logs: list[dict] = []
+    applied_paths: list[str] = []
+    diffs: list[dict] = []
+
+    for item in generate_plan.get("generated", []):
+        target_path = str(item.get("target_path", "")).strip()
+        content = str(item.get("content", ""))
+        anchor_hint = str(item.get("anchor_hint", ""))
+        action = str(item.get("action", "create")).strip()
+
+        if not target_path or not content:
+            continue
+        if action.lower() in ("delete", "replace", "remove", "overwrite"):
+            logs.append({"target_path": target_path, "action": action,
+                         "success": False, "error": f"action '{action}' blocked"})
+            continue
+
+        dst = task.ffmpeg_root / target_path
+
+        # Read before for diff
+        before = ""
+        if dst.exists():
+            try:
+                before = dst.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        if not apply_ok:
+            log = {"target_path": target_path, "action": action,
+                   "applied_at": "dry_run", "success": True}
+        elif Path(target_path).suffix == ".S":
+            log = _inject_asm_file(dst, content, apply_dir)
+        else:
+            log = _inject_text_file(dst, content, anchor_hint, apply_dir, task.cfg)
+
+        logs.append(log)
+        if log.get("success") and log.get("applied_at") not in ("dry_run", "skipped_duplicate"):
+            applied_paths.append(str(dst))
+            # Record diff
+            after = ""
+            if dst.exists():
+                try:
+                    after = dst.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+            if before != after:
+                diffs.append({"file": target_path, "before_len": len(before), "after_len": len(after)})
+
+    write_json(apply_dir / "log.json", logs)
+    record_trajectory_action("patch_apply", f"Applied {len(applied_paths)} file(s)")
+
+    return PatchArtifact(
+        patch_id=patch_id,
+        func=task.target.symbol,
+        points=[],
+        design={},
+        generate_plan=generate_plan,
+        applied_paths=applied_paths,
+        diffs=diffs,
+        success=len(applied_paths) > 0 or not apply_ok,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Combined PATCH handler for the state machine
+# ---------------------------------------------------------------------------
+
+def run_patch_stage(task: TaskContext, kb_patterns: list[dict] | None = None) -> TaskContext:
+    """PATCH handler: runs all 4 sub-steps, persists PatchArtifact, advances state."""
+    print("\n[PATCH] Step 1/4: 定位锚点…")
+    points = locate_patch_points(task)
+    for p in points:
+        print(f"  {p.file}:{p.line} — {p.rationale}")
+
+    print("\n[PATCH] Step 2/4: 设计变更方案…")
+    design = design_patch(task, points, kb_patterns=kb_patterns)
+    for c in design.changes:
+        print(f"  [{c.get('type')}] {c.get('file')} — {c.get('description', '')[:60]}")
+
+    print("\n[PATCH] Step 3/4: 生成代码…（可能需要 20-60 秒）")
+    gen_plan = generate_code(task, design)
+    for item in gen_plan.get("generated", []):
+        print(f"  → {item.get('target_path')} ({item.get('action')})")
+
+    print("\n[PATCH] Step 4/4: 应用到工作区…")
+    artifact = apply_patch(task, gen_plan)
+    artifact.points = [asdict(p) for p in points]
+    artifact.design = asdict(design)
+
+    # Persist
+    aid = task.save_artifact("PATCH", artifact, sub_id=task.target.symbol)
+    task.artifacts.patch_ids.append(aid)
+
+    if artifact.success:
+        for p in artifact.applied_paths:
+            print(f"  ✓ {p}")
+    else:
+        print(f"  ✗ apply failed: {artifact.error}")
+
+    task.current_state = TaskState.BUILD
+    return task

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from ..core.config import AppConfig
 from ..core.llm import LlmError, LlmMessage, api_key_present, chat_completion
 from ..core.prompts import intent_prompt, system_prompt
+from ..core.task import MigrationTarget
 
 
 @dataclass(frozen=True)
@@ -17,15 +18,20 @@ class Intent:
     raw: str
     llm_used: bool
     error: str | None = None
+    target: MigrationTarget | None = None
 
     @property
     def module(self) -> str:
+        if self.target:
+            return self.target.module
         if "." in self.symbol:
             return self.symbol.split(".")[0]
         return self.symbol
 
     @property
     def func_name(self) -> str:
+        if self.target:
+            return self.target.functions[0] if self.target.functions else self.target.symbol
         if "." in self.symbol:
             return self.symbol.split(".", 1)[1]
         return self.symbol
@@ -93,14 +99,27 @@ def _looks_like_migrate(user_text: str) -> bool:
     return any(k in t for k in keywords)
 
 
+def _build_target(symbol: str) -> MigrationTarget | None:
+    """Construct a MigrationTarget from a symbol string."""
+    if not symbol:
+        return None
+    if "." in symbol:
+        module = symbol.split(".")[0]
+    else:
+        module = symbol
+    return MigrationTarget(module=module, symbol=symbol)
+
+
 def parse_intent(cfg: AppConfig, user_text: str) -> Intent:
     wants_migrate = _has_ffmpeg_context(user_text) and _looks_like_migrate(user_text)
     sym = _extract_symbol_heuristic(user_text)
 
     if sym and user_text.strip() == sym:
-        return Intent(action="migrate", symbol=sym, raw="heuristic:symbol_only", llm_used=False)
+        return Intent(action="migrate", symbol=sym, raw="heuristic:symbol_only",
+                      llm_used=False, target=_build_target(sym))
     if wants_migrate and sym:
-        return Intent(action="migrate", symbol=sym, raw="heuristic:migrate", llm_used=False)
+        return Intent(action="migrate", symbol=sym, raw="heuristic:migrate",
+                      llm_used=False, target=_build_target(sym))
 
     if api_key_present(cfg.llm):
         messages = [
@@ -116,13 +135,18 @@ def parse_intent(cfg: AppConfig, user_text: str) -> Intent:
             symbol = str(data.get("symbol", "")).strip() or sym
             if wants_migrate and action != "migrate":
                 action = "migrate"
-            return Intent(action=action, symbol=symbol, raw=raw, llm_used=True)
+            target = _build_target(symbol) if action == "migrate" else None
+            return Intent(action=action, symbol=symbol, raw=raw,
+                          llm_used=True, target=target)
         except LlmError as e:
             action = "migrate" if wants_migrate else "chat"
-            return Intent(action=action, symbol=sym, raw=str(e), llm_used=False, error=str(e))
+            return Intent(action=action, symbol=sym, raw=str(e),
+                          llm_used=False, error=str(e), target=_build_target(sym) if action == "migrate" else None)
         except Exception as e:
             action = "migrate" if wants_migrate else "chat"
-            return Intent(action=action, symbol=sym, raw=repr(e), llm_used=False, error=repr(e))
+            return Intent(action=action, symbol=sym, raw=repr(e),
+                          llm_used=False, error=repr(e), target=_build_target(sym) if action == "migrate" else None)
 
     action = "migrate" if wants_migrate else "chat"
-    return Intent(action=action, symbol=sym, raw="no_llm", llm_used=False)
+    return Intent(action=action, symbol=sym, raw="no_llm",
+                  llm_used=False, target=_build_target(sym) if action == "migrate" else None)

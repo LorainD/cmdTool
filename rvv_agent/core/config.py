@@ -50,11 +50,26 @@ class BoardConfig:
 
 
 @dataclass
+class HumanConfig:
+    """Human-in-the-loop policy defaults.
+
+    Values of ``None`` mean "ask at runtime"; ``True``/``False`` skip the prompt.
+    Can be pre-set in ``[human]`` section of rvv_agent.toml.
+    """
+    apply_ok: bool | None = None
+    exec_ok: bool | None = None
+    scp_ok: bool | None = None
+    scp_password: str = ""
+    run_onboard_ok: bool | None = None
+
+
+@dataclass
 class AppConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     toolchain: ToolchainConfig = field(default_factory=ToolchainConfig)
     ffmpeg: FfmpegConfig = field(default_factory=FfmpegConfig)
     board: BoardConfig = field(default_factory=BoardConfig)
+    human: HumanConfig = field(default_factory=HumanConfig)
 
 
 def _as_path(v: object) -> Path | None:
@@ -114,6 +129,18 @@ def load_config(path: Path | None) -> AppConfig:
             cfg.board.host = str(bd.get("host", cfg.board.host))
             cfg.board.port = int(bd.get("port", cfg.board.port))
             cfg.board.remote_dir = str(bd.get("remote_dir", cfg.board.remote_dir))
+
+        hm = raw.get("human", {})
+        if isinstance(hm, dict):
+            if "apply_ok" in hm:
+                cfg.human.apply_ok = bool(hm["apply_ok"])
+            if "exec_ok" in hm:
+                cfg.human.exec_ok = bool(hm["exec_ok"])
+            if "scp_ok" in hm:
+                cfg.human.scp_ok = bool(hm["scp_ok"])
+            cfg.human.scp_password = str(hm.get("scp_password", cfg.human.scp_password))
+            if "run_onboard_ok" in hm:
+                cfg.human.run_onboard_ok = bool(hm["run_onboard_ok"])
 
     if os.getenv("RVV_AGENT_FFMPEG_ROOT"):
         cfg.ffmpeg.root = Path(os.environ["RVV_AGENT_FFMPEG_ROOT"])

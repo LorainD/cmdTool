@@ -1,28 +1,226 @@
-"""agent.debug — Build-error Fix Agent
+"""agent.debug — Structured build-error diagnosis and rollback.
 
-Provides run_fix_loop() for use in interactive (chat) mode.
-The non-interactive pipeline fix loops live in pipeline.py.
+New state-machine version:
+  - Classifies errors (compile / link / runtime / test_mismatch)
+  - Determines rollback target (locate / design / generate)
+  - Produces DebugArtifact for persistence
+
+Legacy pipeline helpers (run_fix_loop, DebugContext, DebugResult, debug())
+are preserved at the bottom for backward compatibility with pipeline.py.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from enum import Enum
 
 from ..core.config import AppConfig
-from ..core.util import print_llm_error
-from .generate import GenerationResult, _has_real_rvv_functions, fix_generation_with_llm
+from ..core.llm import LlmError, LlmMessage, chat_completion, record_trajectory_action
+from ..core.prompts import system_prompt
+from ..core.prompts_patch import debug_classify_prompt
+from ..core.task import DebugArtifact, TaskContext, TaskState
+from ..core.util import extract_build_errors, now_id, print_llm_error
 
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+class ErrorClass(Enum):
+    COMPILE_ERROR = "compile_error"
+    LINK_ERROR = "link_error"
+    RUNTIME_ERROR = "runtime_error"
+    TEST_MISMATCH = "test_mismatch"
+
+
+class RollbackTarget(Enum):
+    LOCATE = "locate"       # anchor drift / patch applied at wrong position
+    DESIGN = "design"       # build system issue (Makefile, missing include)
+    GENERATE = "generate"   # code syntax / logic error
+
+
+def classify_error(build_output: str) -> ErrorClass:
+    """Rule-based error classification."""
+    lower = build_output.lower()
+    if "undefined reference" in lower or "ld returned" in lower:
+        return ErrorClass.LINK_ERROR
+    if "fail" in lower and ("mismatch" in lower or "checkasm" in lower):
+        return ErrorClass.TEST_MISMATCH
+    if "segfault" in lower or "sigsegv" in lower:
+        return ErrorClass.RUNTIME_ERROR
+    return ErrorClass.COMPILE_ERROR
+
+
+def determine_rollback(
+    error_class: ErrorClass,
+    error_text: str,
+    cfg: AppConfig | None = None,
+) -> RollbackTarget:
+    """Determine where to roll back based on error class and content.
+
+    Uses rules first; falls back to LLM if cfg is provided.
+    """
+    lower = error_text.lower()
+
+    # Rule-based heuristics
+    if error_class == ErrorClass.LINK_ERROR:
+        if "undefined reference" in lower and "init_riscv" in lower:
+            return RollbackTarget.DESIGN  # Makefile didn't add the file
+        if "no such file" in lower:
+            return RollbackTarget.LOCATE
+        return RollbackTarget.DESIGN
+
+    if error_class == ErrorClass.COMPILE_ERROR:
+        if "no such file or directory" in lower:
+            return RollbackTarget.LOCATE
+        if "makefile" in lower or "no rule to make" in lower:
+            return RollbackTarget.DESIGN
+        return RollbackTarget.GENERATE
+
+    if error_class == ErrorClass.TEST_MISMATCH:
+        return RollbackTarget.GENERATE
+
+    if error_class == ErrorClass.RUNTIME_ERROR:
+        return RollbackTarget.GENERATE
+
+    return RollbackTarget.GENERATE
+
+
+# ---------------------------------------------------------------------------
+# LLM-assisted debug (optional enhancement)
+# ---------------------------------------------------------------------------
+
+def _llm_classify(cfg: AppConfig, error_text: str,
+                  current_patch: dict | None = None) -> DebugArtifact | None:
+    """Call LLM for structured error diagnosis. Returns None on failure."""
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=debug_classify_prompt(error_text, current_patch)),
+    ]
+    try:
+        raw = chat_completion(cfg.llm, messages, max_tokens=800, stage="debug_classify")
+        raw = raw.strip()
+        s = raw.find("{")
+        e = raw.rfind("}")
+        if s == -1 or e <= s:
+            return None
+        data = json.loads(raw[s:e + 1])
+        return DebugArtifact(
+            run_id=now_id(),
+            error_class=str(data.get("error_class", "compile_error")),
+            error_text=error_text[:4000],
+            rollback_target=str(data.get("rollback_target", "generate")),
+            fix_actions=[str(a) for a in data.get("fix_actions", [])],
+            llm_suggestion=str(data.get("suggestion", "")),
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# State-machine DEBUG handler
+# ---------------------------------------------------------------------------
+
+_MAX_DEBUG_CYCLES = 3
+
+
+def run_debug_handler(task: TaskContext) -> TaskContext:
+    """DEBUG handler for the state machine.
+
+    1. Load the most recent BuildArtifact
+    2. Extract and classify the error
+    3. Determine rollback target
+    4. Persist DebugArtifact
+    5. Set state back to PATCH (the PATCH handler checks rollback hints)
+    """
+    # Load latest build artifact
+    build_ids = task.artifacts.build_run_ids
+    if not build_ids:
+        print("[DEBUG] No build artifacts found, skipping to DONE")
+        task.current_state = TaskState.DONE
+        return task
+
+    latest_build = task.load_artifact("BUILD", sub_id=build_ids[-1])
+    error_text = extract_build_errors(
+        latest_build.get("stdout", "") + latest_build.get("stderr", "")
+    )
+
+    if not error_text.strip():
+        print("[DEBUG] No errors found in build output, moving to DONE")
+        task.current_state = TaskState.DONE
+        return task
+
+    # Check debug cycle count
+    if len(task.artifacts.debug_run_ids) >= _MAX_DEBUG_CYCLES:
+        print(f"[DEBUG] 已达到最大修复次数 ({_MAX_DEBUG_CYCLES})，请人工处理")
+        print(f"  错误片段: {error_text[-500:]}")
+        task.current_state = TaskState.DONE
+        return task
+
+    # Classify
+    error_class = classify_error(error_text)
+    rollback = determine_rollback(error_class, error_text, task.cfg)
+
+    print(f"\n[DEBUG] 错误分类: {error_class.value}")
+    print(f"[DEBUG] 回滚目标: {rollback.value}")
+
+    # Try LLM-assisted diagnosis for richer suggestions
+    artifact: DebugArtifact | None = None
+    if task.cfg:
+        latest_patch_id = task.artifacts.patch_ids[-1] if task.artifacts.patch_ids else None
+        current_patch = task.load_artifact("PATCH", sub_id=latest_patch_id) if latest_patch_id else None
+        artifact = _llm_classify(task.cfg, error_text, current_patch)
+
+    if artifact is None:
+        artifact = DebugArtifact(
+            run_id=now_id(),
+            error_class=error_class.value,
+            error_text=error_text[:4000],
+            rollback_target=rollback.value,
+            fix_actions=[],
+            llm_suggestion="",
+        )
+
+    # Print suggestions
+    if artifact.fix_actions:
+        print("[DEBUG] 修复建议:")
+        for action in artifact.fix_actions:
+            print(f"  - {action}")
+    if artifact.llm_suggestion:
+        print(f"[DEBUG] LLM 建议: {artifact.llm_suggestion[:200]}")
+
+    # Accumulate build errors for LLM context
+    task.all_build_errors.append(error_text)
+
+    # Persist
+    aid = task.save_artifact("DEBUG", artifact, sub_id=artifact.run_id)
+    task.artifacts.debug_run_ids.append(artifact.run_id)
+
+    record_trajectory_action(
+        "debug",
+        f"Error classified: {artifact.error_class}, rollback to {artifact.rollback_target}",
+    )
+
+    # Roll back to PATCH
+    task.current_state = TaskState.PATCH
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Legacy pipeline helpers (kept for backward compatibility with pipeline.py)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DebugContext:
     symbol: str
-    current_plan: dict        # generate_plan dict ({generated:[...]})
+    current_plan: dict
     max_retries: int = 3
 
 
 @dataclass
 class DebugResult:
     success: bool
-    final_plan: dict          # generate_plan dict after fix attempts
+    final_plan: dict
     attempts: int
     errors: list
 
@@ -30,20 +228,12 @@ class DebugResult:
 def run_fix_loop(
     cfg: AppConfig,
     ctx: DebugContext,
-    get_error_fn,   # () -> tuple[bool, str]
-    apply_fn=None,  # (generate_plan: dict) -> None
+    get_error_fn,
+    apply_fn=None,
 ) -> DebugResult:
-    """Generic build-fix loop for interactive (chat) mode.
+    """Generic build-fix loop (legacy, used by pipeline.py)."""
+    from .generate import GenerationResult, _has_real_rvv_functions, fix_generation_with_llm
 
-    Args:
-        cfg:           App config.
-        ctx:           DebugContext with symbol, initial generate_plan, max retries.
-        get_error_fn:  Callable returning (build_ok: bool, error_text: str).
-        apply_fn:      Optional callback to re-inject after each fix attempt.
-                       Receives the new generate_plan dict.
-    Returns:
-        DebugResult
-    """
     plan = ctx.current_plan
     errors = []
 
@@ -61,7 +251,7 @@ def run_fix_loop(
             cfg, ctx.symbol, err_text, plan
         )
         if fix.error:
-            print_llm_error(fix.error, f"debug/fix#{attempt+1}")
+            print_llm_error(fix.error, f"debug/fix#{attempt + 1}")
             break
         if not _has_real_rvv_functions(fix.generate_plan):
             break
@@ -74,48 +264,17 @@ def run_fix_loop(
                        attempts=attempt + 1, errors=errors)
 
 
-class DebugAgent:
-    """Self-evolving debug agent stub (not yet implemented)."""
-
-    def fix(self, cfg: AppConfig, ctx: DebugContext) -> DebugResult:
-        raise NotImplementedError
-
-    def record_outcome(self, ctx: DebugContext, result: DebugResult) -> None:
-        raise NotImplementedError
-
-    def suggest_fix_prompt(self, symbol: str, error: str) -> str:
-        raise NotImplementedError
-
-
-# ---------------------------------------------------------------------------
-# Context-aware stage wrapper
-# ---------------------------------------------------------------------------
-
 def debug(ctx: "MigrationContext") -> "MigrationContext":
-    """Context-aware single-attempt LLM fix stage.
+    """Context-aware single-attempt LLM fix (legacy, used by pipeline.py)."""
+    from .generate import _has_real_rvv_functions, fix_generation_with_llm
 
-    Reads ``ctx.build_log`` and ``ctx.current_gen``, calls
-    :func:`fix_generation_with_llm` once, and updates ``ctx.current_gen``
-    with the result if the LLM produced valid RVV code.
-
-    The *pipeline* is responsible for looping (calling debug + insert + build
-    repeatedly up to ``_MAX_FIX_ATTEMPTS``).
-
-    Returns *ctx* unchanged if there is nothing to fix (no log or no error).
-
-    Updates
-    -------
-    ``ctx.current_gen`` — updated :class:`GenerationResult` if fix succeeded.
-    """
     if ctx.build_log is None or ctx.current_gen is None:
         return ctx
     if "error" not in ctx.build_log.lower():
         return ctx
 
     fixed_gen = fix_generation_with_llm(
-        ctx.cfg,
-        ctx.operator,
-        ctx.build_log,
+        ctx.cfg, ctx.operator, ctx.build_log,
         ctx.current_gen.generate_plan,
     )
     if fixed_gen.llm_used and _has_real_rvv_functions(fixed_gen.generate_plan):

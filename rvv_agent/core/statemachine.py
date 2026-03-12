@@ -1,0 +1,68 @@
+"""core.statemachine — State-machine engine for the migration pipeline.
+
+Drives ``TaskContext`` through its state transitions.  Each state has a
+registered handler function with signature ``(TaskContext) -> TaskContext``.
+The handler is responsible for:
+  1. Executing the stage logic (LLM calls, tool invocations, user prompts).
+  2. Persisting its artifact via ``task.save_artifact()``.
+  3. Setting ``task.current_state`` to the next state.
+
+The engine calls ``task.save()`` after every handler returns, so the task
+manifest is always up-to-date on disk and can be resumed after a crash.
+"""
+from __future__ import annotations
+
+from typing import Callable
+
+from .task import TaskContext, TaskState
+
+HandlerFn = Callable[[TaskContext], TaskContext]
+
+# Maximum iterations to guard against infinite loops (e.g. DEBUG ↔ PATCH).
+_MAX_ITERATIONS = 30
+
+
+class StateMachine:
+    """Drives a TaskContext through its state handlers until DONE."""
+
+    def __init__(
+        self,
+        task: TaskContext,
+        handlers: dict[TaskState, HandlerFn],
+    ) -> None:
+        self.task = task
+        self.handlers = handlers
+
+    def run(self) -> TaskContext:
+        """Execute handlers until the task reaches DONE (or iteration cap)."""
+        iterations = 0
+        while self.task.current_state != TaskState.DONE:
+            if iterations >= _MAX_ITERATIONS:
+                print(f"[statemachine] iteration cap ({_MAX_ITERATIONS}) reached "
+                      f"at state {self.task.current_state.value}, forcing DONE.")
+                self.task.current_state = TaskState.DONE
+                break
+
+            state = self.task.current_state
+            handler = self.handlers.get(state)
+            if handler is None:
+                raise RuntimeError(
+                    f"No handler registered for state {state.value}"
+                )
+
+            prev_state = state
+            self.task = handler(self.task)
+            iterations += 1
+
+            # Persist after every transition
+            self.task.save()
+
+            # Safety: if handler forgot to advance state, force DONE
+            if self.task.current_state == prev_state:
+                print(f"[statemachine] handler for {state.value} did not "
+                      f"advance state, forcing DONE.")
+                self.task.current_state = TaskState.DONE
+
+        # Final persist
+        self.task.save()
+        return self.task
