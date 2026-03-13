@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..core.util import CmdResult, ensure_dir, fmt_argv, write_json, write_text
 from ..tool.exec import ExecResult
 from .generate import AnalysisResult, Plan
 from .search import Discovery, group_files
+
+if TYPE_CHECKING:
+    from ..core.task import TaskContext
 
 
 def _cmd_section(title: str, res: CmdResult | None) -> str:
@@ -98,4 +102,104 @@ def write_report(
     })
     write_json(run_dir / "analysis.json", analysis.analysis)
 
+    return report_path
+
+
+def write_chat_report(task: "TaskContext") -> Path:
+    """Generate a report from state-machine artifacts (chat mode).
+
+    Reads persisted artifacts from ``task.run_dir/state/`` and produces
+    a Markdown report at ``task.run_dir/report.md``.
+    """
+    run_dir = task.run_dir
+    ensure_dir(run_dir)
+    symbol = task.target.symbol
+
+    md: list[str] = []
+    md.append(f"# rvv-agent chat report\n")
+    md.append(f"## Symbol\n\n- {symbol}\n- task_id: {task.task_id}\n")
+
+    # Plan
+    try:
+        plan = task.load_artifact("PLAN")
+        steps = plan.get("steps", [])
+        md.append("## Plan\n\n" + "\n".join(f"{i+1:02d}. {s}" for i, s in enumerate(steps)) + "\n")
+        if plan.get("refine_history"):
+            md.append("### Refine History\n")
+            for entry in plan["refine_history"]:
+                md.append(f"- [{entry.get('stage', '?')}] {entry.get('feedback', '')}")
+            md.append("")
+    except Exception:
+        md.append("## Plan\n\n- (not available)\n")
+
+    # Reference files
+    try:
+        retrieval = task.load_artifact("RETRIEVE")
+        files = retrieval.get("selected_files", [])
+        if files:
+            md.append("## Reference Files\n\n" + "\n".join(f"- {f}" for f in files) + "\n")
+    except Exception:
+        pass
+
+    # Analysis
+    try:
+        analysis = task.load_artifact("ANALYZE")
+        md.append("## Analysis\n\n```json\n"
+                   + json.dumps(analysis.get("analysis_json", {}), ensure_ascii=False, indent=2)
+                   + "\n```\n")
+    except Exception:
+        pass
+
+    # Patch
+    for pid in task.artifacts.patch_ids:
+        sub = pid.split("/")[-1] if "/" in pid else pid
+        try:
+            patch = task.load_artifact("PATCH", sub_id=sub)
+            md.append(f"## Patch: {sub}\n")
+            for p in patch.get("applied_paths", []):
+                md.append(f"- {p}")
+            md.append("")
+        except Exception:
+            pass
+
+    # Build
+    for bid in task.artifacts.build_run_ids:
+        try:
+            build = task.load_artifact("BUILD", sub_id=bid)
+            phase = build.get("phase", "?")
+            rc = build.get("exitcode", -1)
+            md.append(f"## Build ({phase}, rc={rc})\n")
+            cmd = build.get("cmd", "")
+            if cmd:
+                md.append(f"```\n$ {cmd}\n```\n")
+            stderr = build.get("stderr", "").strip()
+            if stderr and rc != 0:
+                md.append(f"### stderr (tail)\n\n```\n{stderr[-3000:]}\n```\n")
+        except Exception:
+            pass
+
+    # Debug
+    for did in task.artifacts.debug_run_ids:
+        try:
+            dbg = task.load_artifact("DEBUG", sub_id=did)
+            md.append(f"## Debug: {dbg.get('error_class', '?')}\n")
+            md.append(f"- rollback_target: {dbg.get('rollback_target', '?')}")
+            for a in dbg.get("fix_actions", []):
+                md.append(f"- {a}")
+            md.append("")
+        except Exception:
+            pass
+
+    # Final status
+    build_ok = False
+    if task.artifacts.build_run_ids:
+        try:
+            last = task.load_artifact("BUILD", sub_id=task.artifacts.build_run_ids[-1])
+            build_ok = last.get("exitcode", -1) == 0
+        except Exception:
+            pass
+    md.append(f"## Result\n\n- build_success: {build_ok}\n- debug_cycles: {len(task.artifacts.debug_run_ids)}\n")
+
+    report_path = run_dir / "report.md"
+    write_text(report_path, "\n".join(md))
     return report_path

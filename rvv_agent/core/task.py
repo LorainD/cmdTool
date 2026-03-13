@@ -168,6 +168,10 @@ class TaskContext:
     # Accumulated build errors across DEBUG cycles (fed to LLM for context)
     all_build_errors: list[str] = field(default_factory=list)
 
+    # Rollback hint from DEBUG handler: "locate" | "design" | "generate" | ""
+    # PATCH handler reads this to skip earlier sub-steps on retry.
+    rollback_hint: str = ""
+
     # Runtime references — not serialised
     cfg: Any = field(default=None, repr=False)
     ffmpeg_root: Path = field(default_factory=lambda: Path("."))
@@ -188,6 +192,7 @@ class TaskContext:
             "run_dir": str(self.run_dir),
             "artifacts": asdict(self.artifacts),
             "all_build_errors": self.all_build_errors,
+            "rollback_hint": self.rollback_hint,
         }
         p = self._state_dir() / "task.json"
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -206,6 +211,7 @@ class TaskContext:
             run_dir=Path(data["run_dir"]),
             artifacts=artifacts,
             all_build_errors=data.get("all_build_errors", []),
+            rollback_hint=data.get("rollback_hint", ""),
             cfg=cfg,
             ffmpeg_root=cfg.ffmpeg.root.expanduser().resolve() if cfg else Path("."),
         )

@@ -20,6 +20,7 @@ from ..core.prompts import system_prompt
 from ..core.prompts_patch import debug_classify_prompt
 from ..core.task import DebugArtifact, TaskContext, TaskState
 from ..core.util import extract_build_errors, now_id, print_llm_error
+from ..memory.knowledge_base import KnowledgeBase
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +125,15 @@ def _llm_classify(cfg: AppConfig, error_text: str,
 _MAX_DEBUG_CYCLES = 3
 
 
-def run_debug_handler(task: TaskContext) -> TaskContext:
+def run_debug_handler(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskContext:
     """DEBUG handler for the state machine.
 
     1. Load the most recent BuildArtifact
     2. Extract and classify the error
-    3. Determine rollback target
-    4. Persist DebugArtifact
-    5. Set state back to PATCH (the PATCH handler checks rollback hints)
+    3. Consult KB for known fixes
+    4. Determine rollback target
+    5. Persist DebugArtifact
+    6. Set state back to PATCH (the PATCH handler checks rollback hints)
     """
     # Load latest build artifact
     build_ids = task.artifacts.build_run_ids
@@ -164,6 +166,15 @@ def run_debug_handler(task: TaskContext) -> TaskContext:
     print(f"\n[DEBUG] 错误分类: {error_class.value}")
     print(f"[DEBUG] 回滚目标: {rollback.value}")
 
+    # Consult KB for known fixes
+    kb_hints: list[str] = []
+    if kb:
+        known = kb.search_errors(error_class=error_class.value, max_results=3)
+        for rec in known:
+            if rec.fix_strategy:
+                kb_hints.append(f"[KB] {rec.pattern[:80]} → {rec.fix_strategy}")
+                print(f"[DEBUG] 已知修复: {rec.fix_strategy[:100]}")
+
     # Try LLM-assisted diagnosis for richer suggestions
     artifact: DebugArtifact | None = None
     if task.cfg:
@@ -177,9 +188,12 @@ def run_debug_handler(task: TaskContext) -> TaskContext:
             error_class=error_class.value,
             error_text=error_text[:4000],
             rollback_target=rollback.value,
-            fix_actions=[],
+            fix_actions=kb_hints,
             llm_suggestion="",
         )
+    elif kb_hints:
+        # Prepend KB hints to LLM-generated fix_actions
+        artifact.fix_actions = kb_hints + artifact.fix_actions
 
     # Print suggestions
     if artifact.fix_actions:
@@ -200,6 +214,9 @@ def run_debug_handler(task: TaskContext) -> TaskContext:
         "debug",
         f"Error classified: {artifact.error_class}, rollback to {artifact.rollback_target}",
     )
+
+    # Set rollback hint for PATCH handler
+    task.rollback_hint = artifact.rollback_target
 
     # Roll back to PATCH
     task.current_state = TaskState.PATCH

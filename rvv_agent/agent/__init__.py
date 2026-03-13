@@ -26,7 +26,7 @@ from .generate import (
     materialize_package,
 )
 from .intent import Intent, parse_intent
-from .report import write_report
+from .report import write_report, write_chat_report
 from .search import (
     Discovery,
     Match,
@@ -49,7 +49,7 @@ __all__ = [
     # intent
     "Intent", "parse_intent",
     # report
-    "write_report",
+    "write_report", "write_chat_report",
     # search
     "Discovery", "Match", "RetrievalResult",
     "build_context_from_files", "find_symbol", "find_symbol_multi", "select_references",

@@ -64,7 +64,7 @@ def _snippet_already_present(existing: str, snippet: str) -> bool:
 
 
 def _snapshot(apply_dir: Path, src_file: Path) -> None:
-    """Save a copy of src_file into apply_dir/snapshot/."""
+    """Save a copy of src_file into apply_dir/snapshot/ (post-injection, for audit)."""
     try:
         snap_dir = apply_dir / "snapshot"
         parts = src_file.parts
@@ -76,9 +76,78 @@ def _snapshot(apply_dir: Path, src_file: Path) -> None:
         pass
 
 
+def _save_pre_injection(apply_dir: Path, dst: Path) -> None:
+    """Save the ORIGINAL content of dst before injection (for rollback)."""
+    try:
+        pre_dir = apply_dir / "pre_injection"
+        parts = dst.parts
+        rel = Path(*parts[-3:]) if len(parts) >= 3 else Path(dst.name)
+        pre = pre_dir / rel
+        ensure_dir(pre.parent)
+        if dst.exists():
+            write_text(pre, dst.read_text(encoding="utf-8", errors="replace"))
+        else:
+            # Mark as "did not exist" so rollback can delete it
+            write_text(pre, "")
+            (pre.parent / (pre.name + ".__new__")).touch()
+    except Exception:
+        pass
+
+
+def _rollback_previous_apply(task: TaskContext) -> None:
+    """Restore files modified by the most recent apply to their pre-injection state.
+
+    Reads from ``apply_<id>/pre_injection/`` and writes back to ffmpeg_root.
+    Files that didn't exist before injection are deleted.
+    """
+    if not task.artifacts.patch_ids:
+        return
+    # Find the most recent apply directory
+    try:
+        sub = task.artifacts.patch_ids[-1].split("/")[-1]
+        prev_patch = task.load_artifact("PATCH", sub_id=sub)
+        patch_id = prev_patch.get("patch_id", "")
+    except Exception:
+        return
+    if not patch_id:
+        return
+
+    apply_dir = task.run_dir / f"apply_{patch_id}"
+    pre_dir = apply_dir / "pre_injection"
+    if not pre_dir.exists():
+        return
+
+    restored = 0
+    for pre_file in pre_dir.rglob("*"):
+        if not pre_file.is_file():
+            continue
+        if pre_file.name.endswith(".__new__"):
+            continue
+        # Reconstruct the target path
+        rel = pre_file.relative_to(pre_dir)
+        # Check if this was a newly created file
+        marker = pre_file.parent / (pre_file.name + ".__new__")
+        dst = task.ffmpeg_root / rel
+        if marker.exists():
+            # File didn't exist before — delete it
+            if dst.exists():
+                dst.unlink()
+                restored += 1
+        else:
+            # Restore original content
+            original = pre_file.read_text(encoding="utf-8", errors="replace")
+            if dst.exists():
+                write_text(dst, original)
+                restored += 1
+
+    if restored:
+        print(f"[PATCH] 已回滚 {restored} 个文件到注入前状态")
+
+
 def _inject_asm_file(dst: Path, content: str, apply_dir: Path) -> dict:
     """Inject content into a .S file (create or append)."""
     rel = str(dst)
+    _save_pre_injection(apply_dir, dst)
     if not dst.exists():
         ensure_dir(dst.parent)
         write_text(dst, content)
@@ -97,6 +166,7 @@ def _inject_text_file(dst: Path, content: str, anchor_hint: str,
                        apply_dir: Path, cfg: AppConfig | None) -> dict:
     """Inject content into a .c/.h/Makefile (create, or LLM-located insert)."""
     rel = str(dst)
+    _save_pre_injection(apply_dir, dst)
     if not dst.exists():
         ensure_dir(dst.parent)
         write_text(dst, content)
@@ -243,7 +313,11 @@ def design_patch(task: TaskContext, points: list[PatchPoint],
 # ---------------------------------------------------------------------------
 
 def generate_code(task: TaskContext, design: PatchDesign) -> dict:
-    """LLM generates actual code based on the design. Returns generate_plan dict."""
+    """LLM generates actual code based on the design. Returns generate_plan dict.
+
+    On retry (after DEBUG), includes build errors, debug suggestions, and the
+    previous failing code in the prompt so the LLM can produce a targeted fix.
+    """
     analysis = task.load_artifact("ANALYZE")
     retrieval = task.load_artifact("RETRIEVE")
 
@@ -257,6 +331,34 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
             except Exception:
                 pass
 
+    # Collect retry context from previous DEBUG cycles
+    build_errors_text: str | None = None
+    debug_suggestions: list[str] | None = None
+    previous_code: dict | None = None
+
+    if task.all_build_errors:
+        build_errors_text = "\n---\n".join(task.all_build_errors[-2:])  # last 2 errors
+
+    if task.artifacts.debug_run_ids:
+        try:
+            latest_debug = task.load_artifact(
+                "DEBUG", sub_id=task.artifacts.debug_run_ids[-1]
+            )
+            debug_suggestions = latest_debug.get("fix_actions", [])
+            llm_sug = latest_debug.get("llm_suggestion", "")
+            if llm_sug:
+                debug_suggestions = (debug_suggestions or []) + [llm_sug]
+        except Exception:
+            pass
+
+    if task.artifacts.patch_ids:
+        try:
+            sub = task.artifacts.patch_ids[-1].split("/")[-1]
+            prev_patch = task.load_artifact("PATCH", sub_id=sub)
+            previous_code = prev_patch.get("generate_plan")
+        except Exception:
+            pass
+
     messages = [
         LlmMessage(role="system", content=system_prompt()),
         LlmMessage(role="user", content=patch_generate_prompt(
@@ -264,6 +366,9 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
             analysis_json=analysis.get("analysis_json", {}),
             design=asdict(design),
             existing_files_map=existing_map or None,
+            build_errors=build_errors_text,
+            debug_suggestions=debug_suggestions,
+            previous_code=previous_code,
         )),
     ]
     try:
@@ -385,26 +490,86 @@ def apply_patch(task: TaskContext, generate_plan: dict) -> PatchArtifact:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: reload previous PATCH sub-step results for partial retry
+# ---------------------------------------------------------------------------
+
+def _load_previous_points(task: TaskContext) -> list[PatchPoint]:
+    """Load PatchPoints from the most recent PatchArtifact."""
+    if not task.artifacts.patch_ids:
+        return []
+    try:
+        prev = task.load_artifact("PATCH", sub_id=task.artifacts.patch_ids[-1].split("/")[-1])
+        return [PatchPoint(**pp) for pp in prev.get("points", [])]
+    except Exception:
+        return []
+
+
+def _load_previous_design(task: TaskContext) -> PatchDesign:
+    """Load PatchDesign from the most recent PatchArtifact."""
+    if not task.artifacts.patch_ids:
+        return PatchDesign(changes=[], rationale="fallback")
+    try:
+        prev = task.load_artifact("PATCH", sub_id=task.artifacts.patch_ids[-1].split("/")[-1])
+        d = prev.get("design", {})
+        return PatchDesign(changes=d.get("changes", []), rationale=d.get("rationale", ""))
+    except Exception:
+        return PatchDesign(changes=[], rationale="fallback")
+
+
+# ---------------------------------------------------------------------------
 # Combined PATCH handler for the state machine
 # ---------------------------------------------------------------------------
 
 def run_patch_stage(task: TaskContext, kb_patterns: list[dict] | None = None) -> TaskContext:
-    """PATCH handler: runs all 4 sub-steps, persists PatchArtifact, advances state."""
-    print("\n[PATCH] Step 1/4: 定位锚点…")
-    points = locate_patch_points(task)
-    for p in points:
-        print(f"  {p.file}:{p.line} — {p.rationale}")
+    """PATCH handler: runs sub-steps based on rollback hint, persists PatchArtifact.
 
-    print("\n[PATCH] Step 2/4: 设计变更方案…")
-    design = design_patch(task, points, kb_patterns=kb_patterns)
-    for c in design.changes:
-        print(f"  [{c.get('type')}] {c.get('file')} — {c.get('description', '')[:60]}")
+    On first run (no rollback_hint), all 4 steps execute.
+    After DEBUG, rollback_hint controls which sub-steps to re-run:
+      - "locate"   → re-run all 4 (full retry)
+      - "design"   → skip locate, re-run design/generate/apply
+      - "generate" → skip locate+design, re-run generate/apply
+    """
+    hint = task.rollback_hint or ""
+    task.rollback_hint = ""  # consume the hint
 
+    # If this is a retry (after DEBUG), rollback previous injection first
+    is_retry = bool(hint)
+    if is_retry:
+        _rollback_previous_apply(task)
+
+    # Determine which sub-steps to run
+    run_locate = hint in ("", "locate")
+    run_design = hint in ("", "locate", "design")
+
+    # --- Step 1: Locate ---
+    if run_locate:
+        print("\n[PATCH] Step 1/4: 定位锚点…")
+        points = locate_patch_points(task)
+        for p in points:
+            print(f"  {p.file}:{p.line} — {p.rationale}")
+    else:
+        # Reuse points from previous patch artifact
+        points = _load_previous_points(task)
+        print(f"\n[PATCH] Step 1/4: 复用上次锚点 ({len(points)} 个)")
+
+    # --- Step 2: Design ---
+    if run_design:
+        print("\n[PATCH] Step 2/4: 设计变更方案…")
+        design = design_patch(task, points, kb_patterns=kb_patterns)
+        for c in design.changes:
+            print(f"  [{c.get('type')}] {c.get('file')} — {c.get('description', '')[:60]}")
+    else:
+        # Reuse design from previous patch artifact
+        design = _load_previous_design(task)
+        print(f"\n[PATCH] Step 2/4: 复用上次设计方案")
+
+    # --- Step 3: Generate (always re-run when entering PATCH) ---
     print("\n[PATCH] Step 3/4: 生成代码…（可能需要 20-60 秒）")
     gen_plan = generate_code(task, design)
     for item in gen_plan.get("generated", []):
         print(f"  → {item.get('target_path')} ({item.get('action')})")
 
+    # --- Step 4: Apply ---
     print("\n[PATCH] Step 4/4: 应用到工作区…")
     artifact = apply_patch(task, gen_plan)
     artifact.points = [asdict(p) for p in points]

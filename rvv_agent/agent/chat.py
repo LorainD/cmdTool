@@ -228,7 +228,6 @@ def handle_analyze(task: TaskContext) -> TaskContext:
     return task
 
 
-# PLACEHOLDER_HANDLERS_CONTINUE
 
 
 def _refine_plan(cfg: AppConfig, symbol: str, steps: list[str],
@@ -369,7 +368,6 @@ def handle_patch(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskCont
     return run_patch_stage(task, kb_patterns=kb_patterns)
 
 
-# PLACEHOLDER_BUILD_CONTINUE
 
 
 def handle_build(task: TaskContext) -> TaskContext:
@@ -418,6 +416,10 @@ def handle_build(task: TaskContext) -> TaskContext:
 
     if cfg_result.returncode != 0:
         print(f"\nconfigure 失败 (rc={cfg_result.returncode})")
+        # Save build log for debugging
+        error_extract = extract_build_errors(cfg_result.stdout + cfg_result.stderr)
+        write_text(task.run_dir / "build_log.txt",
+                   f"=== configure (rc={cfg_result.returncode}) ===\n{error_extract}\n")
         aid = task.save_artifact("BUILD", build_artifact, sub_id=build_artifact.run_id)
         task.artifacts.build_run_ids.append(build_artifact.run_id)
         task.current_state = TaskState.DEBUG
@@ -445,16 +447,25 @@ def handle_build(task: TaskContext) -> TaskContext:
         task.current_state = TaskState.KB_UPDATE
     else:
         print(f"\n构建失败 (rc={make_result.returncode})")
+        # Save build log with extracted errors
+        error_extract = extract_build_errors(make_result.stdout + make_result.stderr)
+        build_log_path = task.run_dir / "build_log.txt"
+        # Append to existing log (may have configure output from earlier runs)
+        existing_log = ""
+        if build_log_path.exists():
+            existing_log = build_log_path.read_text(encoding="utf-8", errors="replace")
+        write_text(build_log_path,
+                   existing_log + f"\n=== make (rc={make_result.returncode}) ===\n{error_extract}\n")
         record_trajectory_action("build_fail", "Build failed")
         task.current_state = TaskState.DEBUG
 
     return task
 
 
-def handle_debug(task: TaskContext) -> TaskContext:
+def handle_debug(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskContext:
     """DEBUG handler: delegates to structured debug module."""
     from .debug import run_debug_handler
-    return run_debug_handler(task)
+    return run_debug_handler(task, kb=kb)
 
 
 def handle_test(task: TaskContext) -> TaskContext:
@@ -514,34 +525,74 @@ def handle_kb_update(task: TaskContext, kb: KnowledgeBase | None = None) -> Task
         task.current_state = TaskState.DONE
         return task
 
-    # Load analysis for pattern extraction
+    # Load analysis and retrieval for richer extraction
     try:
         analysis = task.load_artifact("ANALYZE")
     except Exception:
         analysis = {}
+    try:
+        retrieval = task.load_artifact("RETRIEVE")
+    except Exception:
+        retrieval = {}
 
     analysis_json = analysis.get("analysis_json", {})
+    selected_files = retrieval.get("selected_files", [])
     symbol = task.target.symbol
+
+    # Build architecture field from file presence
+    arch_info: dict[str, list[str]] = {}
+    for f in selected_files:
+        fl = f.lower()
+        if "/x86/" in fl or "_sse" in fl or "_avx" in fl:
+            arch_info.setdefault("x86", []).append(f)
+        elif "/aarch64/" in fl or "/arm/" in fl or "_neon" in fl:
+            arch_info.setdefault("neon", []).append(f)
+        elif "/riscv/" in fl or "_rvv" in fl:
+            arch_info.setdefault("rvv", []).append(f)
+
+    # Build source field with c_paths
+    c_paths = [f for f in selected_files if f.endswith((".c", ".h"))]
+
+    # Extract semantic tags from analysis
+    algo_class = "unknown"
+    tags: list[str] = []
+    if isinstance(analysis_json.get("pattern"), list):
+        tags = [str(t) for t in analysis_json["pattern"]]
+        algo_class = tags[0] if tags else "unknown"
+    elif analysis_json.get("pattern"):
+        algo_class = str(analysis_json["pattern"])
+        tags = [algo_class]
 
     # Create a pattern from this successful migration
     new_pattern = Pattern(
         pattern_id=f"{symbol}_{task.task_id}",
-        source={"symbol": symbol},
+        source={"symbol": symbol, "c_paths": c_paths},
         semantic_ir={
-            "algorithm_class": analysis_json.get("pattern", ["unknown"])[0]
-            if isinstance(analysis_json.get("pattern"), list)
-            else str(analysis_json.get("pattern", "unknown")),
+            "algorithm_class": algo_class,
+            "tags": tags,
+            "loop": analysis_json.get("loop_structure", ""),
+            "memory_pattern": analysis_json.get("memory_access", ""),
         },
         simd_strategy={
             "vectorize": analysis_json.get("vectorizable", True),
             "reduction": analysis_json.get("reduction", False),
             "tail_handling": "mask" if analysis_json.get("tail_required") else "none",
+            "unroll": analysis_json.get("unroll_factor", 1),
         },
-        architecture={},
+        architecture=arch_info,
         metadata={"weight": 0.5, "success_count": 1, "fail_count": 0},
         notes=f"Auto-extracted from migration of {symbol}",
     )
     kb.add_pattern(new_pattern)
+
+    # Update weight for any patterns that were used during PLAN/PATCH
+    # (build succeeded if we reached KB_UPDATE)
+    for pid in task.artifacts.patch_ids:
+        # The pattern_id format is "{symbol}_{task_id}", try to find matching
+        existing = kb.search_patterns(symbol=symbol, max_results=5)
+        for p in existing:
+            if p.pattern_id != new_pattern.pattern_id:
+                kb.update_weight(p.pattern_id, success=True)
 
     # Record any debug errors as error patterns
     new_errors: list[dict] = []
@@ -660,7 +711,7 @@ def run_chat(cfg: AppConfig) -> int:
             TaskState.PLAN: lambda t: handle_plan(t, kb),
             TaskState.PATCH: lambda t: handle_patch(t, kb),
             TaskState.BUILD: handle_build,
-            TaskState.DEBUG: handle_debug,
+            TaskState.DEBUG: lambda t: handle_debug(t, kb),
             TaskState.TEST: handle_test,
             TaskState.KB_UPDATE: lambda t: handle_kb_update(t, kb),
         }
@@ -673,6 +724,14 @@ def run_chat(cfg: AppConfig) -> int:
             print_red(f"\n迁移过程出错: {e}")
             import traceback
             traceback.print_exc()
+
+        # Generate report
+        try:
+            from .report import write_chat_report
+            rpt = write_chat_report(task)
+            print(f"报告已生成: {rpt}")
+        except Exception as e:
+            print_yellow(f"报告生成失败: {e}")
 
         # Save trajectory
         traj = get_trajectory_dict(model=cfg.llm.model, endpoint=cfg.llm.base_url)

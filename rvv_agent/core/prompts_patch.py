@@ -47,7 +47,6 @@ def patch_design_prompt(
     kb_patterns: list[dict] | None = None,
 ) -> str:
     """Prompt for Step 2: design the patch (what to change, not the code)."""
-    # --- PLACEHOLDER_DESIGN ---
     kb_section = ""
     if kb_patterns:
         kb_section = f"\n## 知识库中的相关模式\n{json.dumps(kb_patterns, ensure_ascii=False, indent=2)}"
@@ -81,14 +80,37 @@ def patch_generate_prompt(
     analysis_json: dict,
     design: dict,
     existing_files_map: dict[str, str] | None = None,
+    build_errors: str | None = None,
+    debug_suggestions: list[str] | None = None,
+    previous_code: dict | None = None,
 ) -> str:
-    """Prompt for Step 3: generate actual code based on design."""
+    """Prompt for Step 3: generate actual code based on design.
+
+    When ``build_errors`` is provided (retry after DEBUG), the prompt includes
+    the error text, debug suggestions, and the previous failing code so the LLM
+    can produce a targeted fix rather than regenerating from scratch.
+    """
     existing_section = ""
     if existing_files_map:
         parts = []
         for path, content in existing_files_map.items():
             parts.append(f"### {path}\n```\n{content[:3000]}\n```")
         existing_section = "\n## 现有文件内容（需要做增量合并）\n" + "\n".join(parts)
+
+    fix_section = ""
+    if build_errors:
+        fix_section += f"\n## 上次构建错误（必须修复）\n```\n{build_errors[:4000]}\n```\n"
+        if debug_suggestions:
+            fix_section += "\n## 诊断建议\n" + "\n".join(f"- {s}" for s in debug_suggestions) + "\n"
+        if previous_code:
+            prev_parts = []
+            for item in previous_code.get("generated", []):
+                tp = item.get("target_path", "?")
+                code = item.get("content", "")
+                prev_parts.append(f"### {tp}\n```\n{code[:3000]}\n```")
+            if prev_parts:
+                fix_section += "\n## 上次生成的代码（有错误，需要修正）\n" + "\n".join(prev_parts) + "\n"
+        fix_section += "\n请根据以上错误信息修正代码，而不是从头重新生成。\n"
 
     return f"""你是 FFmpeg RVV 迁移专家。请根据变更设计生成完整代码。
 
@@ -99,7 +121,7 @@ def patch_generate_prompt(
 
 ## 变更设计
 {json.dumps(design, ensure_ascii=False, indent=2)}
-{existing_section}
+{existing_section}{fix_section}
 
 ## 要求
 1. .S 文件：使用 RISC-V Vector (RVV) 汇编，遵循 FFmpeg 汇编风格
