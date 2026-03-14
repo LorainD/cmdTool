@@ -1,28 +1,40 @@
+"""pipeline — Non-interactive migration pipeline (state-machine driven).
+
+Rewritten to share the same StateMachine infrastructure as chat mode.
+Four handlers are reused from chat.py (ANALYZE, PATCH, DEBUG, KB_UPDATE);
+four are pipeline-specific non-interactive variants (INTENT, RETRIEVE, PLAN, BUILD).
+"""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .agent.generate import (
-    AnalysisResult,
-    GenerationResult,
-    analyze as analyze_stage,
-    fix_generation_with_llm,
-    generate as generate_stage,
-    save_generate_folder,
-    _has_real_rvv_functions,
-    fixed_plan,
+from .agent.chat import handle_analyze, handle_debug, handle_kb_update, handle_patch
+from .agent.generate import fixed_plan
+from .agent.report import write_chat_report
+from .agent.search import build_context_from_files, select_references
+from .core.llm import get_trajectory_dict, record_trajectory_action, reset_trajectory
+from .core.statemachine import StateMachine
+from .core.task import (
+    BuildArtifact,
+    MigrationTarget,
+    PlanArtifact,
+    RetrievalArtifact,
+    TaskContext,
+    TaskState,
 )
-from .agent.inject import InjectResult, inject_generate_plan, insert as insert_stage
-from .agent.report import write_report
-from .agent.search import Discovery, find_symbol, search as search_stage
-from .core.config import AppConfig
-from .core.context import MigrationContext
-from .core.util import ensure_dir, now_id, slug, write_text
-from .tool.exec import ExecResult, run_configure, run_make_checkasm
-
-
-_MAX_FIX_ATTEMPTS = 3
+from .core.util import (
+    ensure_dir,
+    extract_build_errors,
+    fmt_argv,
+    now_id,
+    slug,
+    write_json,
+    write_text,
+)
+from .memory.knowledge_base import KnowledgeBase
+from .tool.exec import configure_argv, make_checkasm_argv, run_configure, run_make_checkasm
 
 
 @dataclass
@@ -33,8 +45,196 @@ class MigrateResult:
     exec_summary: str
 
 
+# ---------------------------------------------------------------------------
+# Pipeline-specific handlers (non-interactive)
+# ---------------------------------------------------------------------------
+
+def _handle_intent_pipeline(task: TaskContext) -> TaskContext:
+    """INTENT: validate symbol, persist, advance."""
+    symbol = task.target.symbol
+    if not symbol:
+        raise ValueError("pipeline mode requires a symbol argument")
+    print(f"\n[pipeline] 迁移目标: {symbol} (module: {task.target.module})")
+    task.save_artifact("INTENT", {
+        "module": task.target.module,
+        "symbol": symbol,
+        "functions": task.target.functions,
+    })
+    record_trajectory_action("intent", f"Target confirmed: {symbol}")
+    task.current_state = TaskState.RETRIEVE
+    return task
+
+
+def _handle_retrieve_pipeline(task: TaskContext) -> TaskContext:
+    """RETRIEVE: search + select references, no user interaction."""
+    ffmpeg_root = task.ffmpeg_root
+    symbol = task.target.symbol
+
+    retrieval = select_references(task.cfg, ffmpeg_root, symbol)
+    write_text(task.run_dir / "retrieval_raw.txt", retrieval.raw_text + "\n")
+    selected = retrieval.selected
+
+    def _list(key: str) -> list[str]:
+        v = selected.get(key, [])
+        return [str(x) for x in v] if isinstance(v, list) else []
+
+    selected_files: list[str] = []
+    for k in ("c", "x86", "arm", "riscv", "headers", "makefiles", "checkasm"):
+        selected_files.extend(_list(k))
+    selected_files = list(dict.fromkeys(selected_files))
+
+    for r in retrieval.existing_rvv:
+        if r not in selected_files:
+            selected_files.append(r)
+
+    print(f"[pipeline] 参考文件: {len(selected_files)} 个")
+    record_trajectory_action(
+        "select_refs",
+        f"Reference files selected ({len(selected_files)} files)",
+        detail="\n".join(selected_files),
+        event_type="human_output",
+    )
+
+    ctx_text = build_context_from_files(
+        ffmpeg_root, symbol=symbol, files=selected_files,
+    )
+    write_text(task.run_dir / "context.txt", ctx_text)
+
+    artifact = RetrievalArtifact(
+        discovery_json={
+            "symbol": retrieval.discovery.symbol,
+            "matches": [m.__dict__ for m in retrieval.discovery.matches[:200]],
+        },
+        selected_files=selected_files,
+        code_context=ctx_text,
+    )
+    aid = task.save_artifact("RETRIEVE", artifact)
+    task.artifacts.retrieval_id = aid
+    task.current_state = TaskState.ANALYZE
+    return task
+
+
+def _handle_plan_pipeline(task: TaskContext) -> TaskContext:
+    """PLAN: use fixed_plan (no LLM, no user refinement)."""
+    symbol = task.target.symbol
+    plan = fixed_plan(symbol)
+    print(f"[pipeline] Plan: {len(plan.steps)} steps")
+
+    artifact = PlanArtifact(
+        steps=plan.steps,
+        function_order=[symbol],
+        acceptance_criteria={"build_ok": True},
+    )
+    aid = task.save_artifact("PLAN", artifact)
+    task.artifacts.plan_id = aid
+    record_trajectory_action("plan", f"Fixed plan for {symbol}")
+    task.current_state = TaskState.PATCH
+    return task
+
+
+def _handle_build_pipeline(task: TaskContext) -> TaskContext:
+    """BUILD: configure + make checkasm, no user prompts."""
+    if not task.cfg.human.exec_ok:
+        print("[pipeline] 跳过构建（--exec 未指定）")
+        task.current_state = TaskState.DONE
+        return task
+
+    ffmpeg_root = task.ffmpeg_root
+    build_dir = ffmpeg_root / task.cfg.ffmpeg.build_dir
+    jobs = task.jobs if task.jobs > 0 else max(1, os.cpu_count() or 1)
+    ensure_dir(build_dir)
+
+    # --- configure ---
+    print(f"\n[pipeline] configure…")
+    cfg_result = run_configure(task.cfg, ffmpeg_root, build_dir)
+
+    build_artifact = BuildArtifact(
+        run_id=now_id(),
+        cmd=fmt_argv(configure_argv(task.cfg, ffmpeg_root)),
+        stdout=cfg_result.stdout,
+        stderr=cfg_result.stderr,
+        exitcode=cfg_result.returncode,
+        phase="configure",
+    )
+
+    if cfg_result.returncode != 0:
+        print(f"[pipeline] configure 失败 (rc={cfg_result.returncode})")
+        error_extract = extract_build_errors(cfg_result.stdout + cfg_result.stderr)
+        write_text(task.run_dir / "build_log.txt",
+                   f"=== configure (rc={cfg_result.returncode}) ===\n{error_extract}\n")
+        task.save_artifact("BUILD", build_artifact, sub_id=build_artifact.run_id)
+        task.artifacts.build_run_ids.append(build_artifact.run_id)
+        task.current_state = TaskState.DEBUG
+        return task
+
+    # --- make checkasm ---
+    print(f"[pipeline] make checkasm (jobs={jobs})…")
+    make_result = run_make_checkasm(task.cfg, build_dir, jobs)
+
+    build_artifact = BuildArtifact(
+        run_id=now_id(),
+        cmd=fmt_argv(make_checkasm_argv(jobs=jobs)),
+        stdout=make_result.stdout,
+        stderr=make_result.stderr,
+        exitcode=make_result.returncode,
+        phase="make",
+        artifact_path=str(build_dir / "tests" / "checkasm" / "checkasm"),
+    )
+    task.save_artifact("BUILD", build_artifact, sub_id=build_artifact.run_id)
+    task.artifacts.build_run_ids.append(build_artifact.run_id)
+
+    if make_result.returncode == 0:
+        print("[pipeline] 构建成功 ✓")
+        record_trajectory_action("build_success", "Build succeeded")
+        task.current_state = TaskState.KB_UPDATE
+    else:
+        print(f"[pipeline] 构建失败 (rc={make_result.returncode})")
+        error_extract = extract_build_errors(make_result.stdout + make_result.stderr)
+        build_log_path = task.run_dir / "build_log.txt"
+        existing_log = ""
+        if build_log_path.exists():
+            existing_log = build_log_path.read_text(encoding="utf-8", errors="replace")
+        write_text(build_log_path,
+                   existing_log + f"\n=== make (rc={make_result.returncode}) ===\n{error_extract}\n")
+        record_trajectory_action("build_fail", "Build failed")
+        task.current_state = TaskState.DEBUG
+
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Helper: derive MigrateResult from TaskContext
+# ---------------------------------------------------------------------------
+
+def _derive_exec_result(task: TaskContext) -> tuple[bool, str]:
+    """Read BuildArtifacts to produce exec_failed + exec_summary."""
+    if not task.artifacts.build_run_ids:
+        return False, "skipped_build: exec not requested or no valid generation"
+
+    configure_rc: int | str = "skipped"
+    make_rc: int | str = "skipped"
+    for bid in task.artifacts.build_run_ids:
+        try:
+            b = task.load_artifact("BUILD", sub_id=bid)
+        except Exception:
+            continue
+        if b.get("phase") == "configure":
+            configure_rc = b.get("exitcode", -1)
+        elif b.get("phase") == "make":
+            make_rc = b.get("exitcode", -1)
+
+    last_build = task.load_artifact("BUILD", sub_id=task.artifacts.build_run_ids[-1])
+    exec_failed = last_build.get("exitcode", -1) != 0
+    exec_summary = f"configure_rc={configure_rc} checkasm_build_rc={make_rc}"
+    return exec_failed, exec_summary
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def run_migrate(
-    cfg: AppConfig,
+    cfg: "AppConfig",
     *,
     symbol: str,
     ffmpeg_root: Path,
@@ -42,167 +242,72 @@ def run_migrate(
     jobs: int,
     apply: bool,
 ) -> MigrateResult:
-    """Two-stage migration pipeline.
+    """Non-interactive migration pipeline (state-machine driven).
 
-    Stage 1 — Generator LLM
-        Produces code snippets (only new code) saved under run_dir/generate/.
-
-    Stage 2 — Injector (+ optional Locator LLM for init.c / Makefile)
-        Reads run_dir/generate/plan.json and applies safe append/create to
-        the FFmpeg workspace.  Results logged under run_dir/apply/.
+    Signature and return type are unchanged from the original implementation
+    to maintain CLI compatibility.
     """
-    # ── Initialise context ────────────────────────────────────────────────
-    ctx = MigrationContext(
-        operator=symbol,
-        repo_root=ffmpeg_root,
+    from .core.config import AppConfig  # deferred to avoid circular
+
+    # 1. Pre-configure HumanConfig for non-interactive mode
+    cfg.human.apply_ok = apply
+    cfg.human.exec_ok = do_exec
+
+    # 2. Build MigrationTarget
+    module = symbol.split(".")[0] if "." in symbol else symbol
+    target = MigrationTarget(module=module, symbol=symbol)
+
+    # 3. Create TaskContext
+    task_id = now_id()
+    run_dir = Path("runs") / f"{task_id}_{slug(symbol)}"
+    ensure_dir(run_dir)
+
+    task = TaskContext(
+        task_id=task_id,
+        target=target,
+        current_state=TaskState.INTENT,
+        run_dir=run_dir,
         cfg=cfg,
-        do_exec=do_exec,
-        apply=apply,
+        ffmpeg_root=ffmpeg_root.expanduser().resolve(),
         jobs=jobs,
     )
-    ctx.run_dir = Path("runs") / f"{now_id()}_{slug(symbol)}"
-    ensure_dir(ctx.run_dir)
 
-    plan = fixed_plan(symbol)
+    # 4. Load KB
+    kb = KnowledgeBase(Path("knowledge_base.json"))
+    kb.load()
 
-    # ── Stage: Search (locate symbol in the source tree) ──────────────────
-    ctx = search_stage(ctx)
+    # 5. Reset trajectory
+    reset_trajectory()
 
-    # ── Stage: Analyze (LLM semantic analysis) ────────────────────────────
-    ctx = analyze_stage(ctx)
+    # 6. Register handlers
+    handlers = {
+        TaskState.INTENT:    _handle_intent_pipeline,
+        TaskState.RETRIEVE:  _handle_retrieve_pipeline,
+        TaskState.ANALYZE:   handle_analyze,
+        TaskState.PLAN:      _handle_plan_pipeline,
+        TaskState.PATCH:     lambda t: handle_patch(t, kb),
+        TaskState.BUILD:     _handle_build_pipeline,
+        TaskState.DEBUG:     lambda t: handle_debug(t, kb),
+        TaskState.KB_UPDATE: lambda t: handle_kb_update(t, kb),
+    }
 
-    # ── Stage: Generate (LLM code generation) ─────────────────────────────
-    ctx = generate_stage(ctx)
+    # 7. Run state machine
+    sm = StateMachine(task, handlers)
+    task = sm.run()
 
-    gen = ctx.current_gen
-    generation_valid = gen.llm_used and _has_real_rvv_functions(gen.generate_plan)
+    # 8. Generate report
+    report_path = write_chat_report(task)
 
-    if not generation_valid:
-        write_text(ctx.run_dir / "generate_raw.txt", gen.raw_text or "(empty)")
-        write_text(
-            ctx.run_dir / "generate_error.txt",
-            f"LLM was not used (fallback). error={gen.error}"
-            if not gen.llm_used
-            else "LLM responded but no real RVV functions found in output.",
-        )
+    # 9. Save trajectory + KB
+    traj = get_trajectory_dict(model=cfg.llm.model, endpoint=cfg.llm.base_url)
+    write_json(run_dir / "trajectory.json", traj)
+    kb.save()
 
-    # ── Stage: Inject (apply generated code to workspace) ─────────────────
-    ctx = insert_stage(ctx)
-
-    # ── Stage: Build + LLM fix loops ──────────────────────────────────────
-    ctx.exec_result = ExecResult()
-    exec_failed = False
-    exec_summary = ""
-
-    if do_exec and generation_valid:
-        build_dir = ffmpeg_root / cfg.ffmpeg.build_dir
-        ensure_dir(build_dir)
-        ctx.exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
-
-        if ctx.exec_result.configure.returncode != 0:
-            exec_failed = True
-            ctx.build_log = (
-                (ctx.exec_result.configure.stdout or "")
-                + (ctx.exec_result.configure.stderr or "")
-            )
-            # ── LLM-fix loop on configure failure ─────────────────────────
-            for attempt in range(1, _MAX_FIX_ATTEMPTS + 1):
-                write_text(
-                    ctx.run_dir / f"fix_attempt{attempt}_configure_error.txt",
-                    ctx.build_log,
-                )
-                fixed_gen = fix_generation_with_llm(
-                    cfg, symbol,
-                    build_error=ctx.build_log,
-                    current_plan=ctx.current_gen.generate_plan,
-                )
-                write_text(
-                    ctx.run_dir / f"fix_attempt{attempt}_generate_raw.txt",
-                    fixed_gen.raw_text,
-                )
-                if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.generate_plan):
-                    break
-                ctx.current_gen = fixed_gen
-                save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
-                ctx = insert_stage(ctx, attempt=attempt)
-                ctx.exec_result.configure = run_configure(cfg, ffmpeg_root, build_dir)
-                if ctx.exec_result.configure.returncode == 0:
-                    exec_failed = False
-                    break
-                ctx.build_log = (
-                    (ctx.exec_result.configure.stdout or "")
-                    + (ctx.exec_result.configure.stderr or "")
-                )
-
-        if ctx.exec_result.configure is not None and ctx.exec_result.configure.returncode == 0:
-            ctx.exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
-            if ctx.exec_result.make_checkasm.returncode != 0:
-                exec_failed = True
-                ctx.build_log = (
-                    (ctx.exec_result.make_checkasm.stdout or "")
-                    + (ctx.exec_result.make_checkasm.stderr or "")
-                )
-                ctx.checkasm_output = ctx.build_log
-                # ── LLM-fix loop on make checkasm failure ──────────────────
-                for attempt in range(1, _MAX_FIX_ATTEMPTS + 1):
-                    write_text(
-                        ctx.run_dir / f"fix_attempt{attempt}_build_error.txt",
-                        ctx.build_log,
-                    )
-                    fixed_gen = fix_generation_with_llm(
-                        cfg, symbol,
-                        build_error=ctx.build_log,
-                        current_plan=ctx.current_gen.generate_plan,
-                    )
-                    write_text(
-                        ctx.run_dir / f"fix_attempt{attempt}_generate_raw.txt",
-                        fixed_gen.raw_text,
-                    )
-                    if not fixed_gen.llm_used or not _has_real_rvv_functions(fixed_gen.generate_plan):
-                        break
-                    ctx.current_gen = fixed_gen
-                    save_generate_folder(ctx.run_dir, fixed_gen.generate_plan, attempt=attempt)
-                    ctx = insert_stage(ctx, attempt=attempt)
-                    ctx.exec_result.make_checkasm = run_make_checkasm(cfg, build_dir, jobs)
-                    if ctx.exec_result.make_checkasm.returncode == 0:
-                        exec_failed = False
-                        ctx.checkasm_output = (
-                            (ctx.exec_result.make_checkasm.stdout or "")
-                            + (ctx.exec_result.make_checkasm.stderr or "")
-                        )
-                        break
-                    ctx.build_log = (
-                        (ctx.exec_result.make_checkasm.stdout or "")
-                        + (ctx.exec_result.make_checkasm.stderr or "")
-                    )
-                    ctx.checkasm_output = ctx.build_log
-
-        exec_summary = (
-            f"generation_valid={generation_valid} "
-            f"configure_rc={ctx.exec_result.configure.returncode if ctx.exec_result.configure else 'skipped'} "
-            f"checkasm_build_rc={ctx.exec_result.make_checkasm.returncode if ctx.exec_result.make_checkasm else 'skipped'}"
-        )
-    elif not generation_valid:
-        exec_summary = "skipped_build: no real RVV functions generated"
-
-    report_path = write_report(
-        ctx.run_dir,
-        plan=plan,
-        discovery=ctx.discovery,
-        analysis=ctx.analysis_result,
-        generation_raw=ctx.current_gen.raw_text if ctx.current_gen else "",
-        materialized=ctx.inject_result.applied_paths if ctx.inject_result else [],
-        exec_result=ctx.exec_result,
-    )
-
-    # Save LLM trajectory for this pipeline run
-    from .core.llm import get_trajectory_dict
-    from .core.util import write_json as _wj_traj
-    _traj = get_trajectory_dict(model=cfg.llm.model, endpoint=cfg.llm.base_url)
-    _wj_traj(ctx.run_dir / "trajectory.json", _traj)
+    # 10. Derive result
+    exec_failed, exec_summary = _derive_exec_result(task)
 
     return MigrateResult(
-        run_dir=ctx.run_dir,
+        run_dir=run_dir,
         report_path=report_path,
         exec_failed=exec_failed,
         exec_summary=exec_summary,

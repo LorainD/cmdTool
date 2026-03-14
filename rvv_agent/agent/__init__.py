@@ -2,30 +2,26 @@
 
 子模块分工
 ----------
+analyze  — LLM 语义分析（AnalysisResult / analyze_with_llm）
 chat     — 交互式 human-in-the-loop 迁移循环（状态机驱动）
 debug    — 结构化构建错误诊断 + 回滚决策
-generate — 计划生成、语义分析、LLM 代码生成与修复（pipeline 模式）
-inject   — 代码注入（pipeline 模式）
+generate — LLM 代码生成与修复（GenerationResult / fix_generation_with_llm）
+inject   — 代码注入（pipeline 模式，已废弃，由 patch.py 替代）
 intent   — 用户意图解析（Intent / parse_intent）
 patch    — 4步 PATCH 阶段（locate/design/generate/apply，chat 模式）
+plan     — 迁移计划生成（Plan / fixed_plan / llm_plan）
 report   — 运行报告落盘（write_report）
 search   — 源码搜索、参考文件检索、上下文构建
 """
 
+from .analyze import AnalysisResult, analyze_with_llm
 from .chat import run_chat
-from .debug import run_fix_loop, run_debug_handler
+from .debug import run_debug_handler
 from .generate import (
-    AnalysisResult,
     GenerationResult,
-    Plan,
-    analyze_with_llm,
-    fix_generation_with_llm,
-    fixed_plan,
-    generate_with_llm,
-    llm_plan,
-    materialize_package,
 )
 from .intent import Intent, parse_intent
+from .plan import Plan, fixed_plan, llm_plan
 from .report import write_report, write_chat_report
 from .search import (
     Discovery,
@@ -38,16 +34,18 @@ from .search import (
 )
 
 __all__ = [
+    # analyze
+    "AnalysisResult", "analyze_with_llm",
     # chat
     "run_chat",
     # debug
-    "run_fix_loop", "run_debug_handler",
+    "run_debug_handler",
     # generate
-    "AnalysisResult", "GenerationResult", "Plan",
-    "analyze_with_llm", "fix_generation_with_llm", "fixed_plan",
-    "generate_with_llm", "llm_plan", "materialize_package",
+    "GenerationResult",
     # intent
     "Intent", "parse_intent",
+    # plan
+    "Plan", "fixed_plan", "llm_plan",
     # report
     "write_report", "write_chat_report",
     # search

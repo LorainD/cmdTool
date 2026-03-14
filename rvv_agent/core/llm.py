@@ -11,7 +11,7 @@ from typing import Any
 
 from .config import LlmConfig
 
-
+#TODO:按照之前patch、search部分，应该要添加llm的错误处理，特别是断线重连部分
 @dataclass(frozen=True)
 class LlmMessage:
     role: str  # system | user | assistant

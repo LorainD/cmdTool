@@ -224,76 +224,84 @@ def run_debug_handler(task: TaskContext, kb: KnowledgeBase | None = None) -> Tas
 
 
 # ---------------------------------------------------------------------------
-# Legacy pipeline helpers (kept for backward compatibility with pipeline.py)
+# Legacy pipeline helpers (DEPRECATED — 已被状态机架构替代)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class DebugContext:
-    symbol: str
-    current_plan: dict
-    max_retries: int = 3
+# @dataclass
+# class DebugContext:
+#     symbol: str
+#     current_plan: dict
+#     max_retries: int = 3
 
 
-@dataclass
-class DebugResult:
-    success: bool
-    final_plan: dict
-    attempts: int
-    errors: list
+# @dataclass
+# class DebugResult:
+#     success: bool
+#     final_plan: dict
+#     attempts: int
+#     errors: list
 
 
-def run_fix_loop(
-    cfg: AppConfig,
-    ctx: DebugContext,
-    get_error_fn,
-    apply_fn=None,
-) -> DebugResult:
-    """Generic build-fix loop (legacy, used by pipeline.py)."""
-    from .generate import GenerationResult, _has_real_rvv_functions, fix_generation_with_llm
+# def run_fix_loop(
+#     cfg: AppConfig,
+#     ctx: DebugContext,
+#     get_error_fn,
+#     apply_fn=None,
+# ) -> DebugResult:
+#     """Generic build-fix loop.
+#
+#     .. deprecated::
+#         Pipeline now uses state-machine handlers (run_debug_handler).
+#     """
+#     from .generate import GenerationResult, _has_real_rvv_functions, fix_generation_with_llm
+#
+#     plan = ctx.current_plan
+#     errors = []
+#
+#     for attempt in range(ctx.max_retries + 1):
+#         ok, err_text = get_error_fn()
+#         if ok:
+#             return DebugResult(success=True, final_plan=plan,
+#                                attempts=attempt, errors=errors)
+#         errors.append(err_text)
+#
+#         if attempt >= ctx.max_retries:
+#             break
+#
+#         fix: GenerationResult = fix_generation_with_llm(
+#             cfg, ctx.symbol, err_text, plan
+#         )
+#         if fix.error:
+#             print_llm_error(fix.error, f"debug/fix#{attempt + 1}")
+#             break
+#         if not _has_real_rvv_functions(fix.generate_plan):
+#             break
+#
+#         plan = fix.generate_plan
+#         if apply_fn is not None:
+#             apply_fn(plan)
+#
+#     return DebugResult(success=False, final_plan=plan,
+#                        attempts=attempt + 1, errors=errors)
 
-    plan = ctx.current_plan
-    errors = []
 
-    for attempt in range(ctx.max_retries + 1):
-        ok, err_text = get_error_fn()
-        if ok:
-            return DebugResult(success=True, final_plan=plan,
-                               attempts=attempt, errors=errors)
-        errors.append(err_text)
-
-        if attempt >= ctx.max_retries:
-            break
-
-        fix: GenerationResult = fix_generation_with_llm(
-            cfg, ctx.symbol, err_text, plan
-        )
-        if fix.error:
-            print_llm_error(fix.error, f"debug/fix#{attempt + 1}")
-            break
-        if not _has_real_rvv_functions(fix.generate_plan):
-            break
-
-        plan = fix.generate_plan
-        if apply_fn is not None:
-            apply_fn(plan)
-
-    return DebugResult(success=False, final_plan=plan,
-                       attempts=attempt + 1, errors=errors)
-
-
-def debug(ctx: "MigrationContext") -> "MigrationContext":
-    """Context-aware single-attempt LLM fix (legacy, used by pipeline.py)."""
-    from .generate import _has_real_rvv_functions, fix_generation_with_llm
-
-    if ctx.build_log is None or ctx.current_gen is None:
-        return ctx
-    if "error" not in ctx.build_log.lower():
-        return ctx
-
-    fixed_gen = fix_generation_with_llm(
-        ctx.cfg, ctx.operator, ctx.build_log,
-        ctx.current_gen.generate_plan,
-    )
-    if fixed_gen.llm_used and _has_real_rvv_functions(fixed_gen.generate_plan):
-        ctx.current_gen = fixed_gen
-    return ctx
+# def debug(ctx: "MigrationContext") -> "MigrationContext":
+#     """Context-aware single-attempt LLM fix (legacy, used by pipeline.py).
+#
+#     .. deprecated::
+#         Pipeline now uses state-machine handlers (run_debug_handler).
+#     """
+#     from .generate import _has_real_rvv_functions, fix_generation_with_llm
+#
+#     if ctx.build_log is None or ctx.current_gen is None:
+#         return ctx
+#     if "error" not in ctx.build_log.lower():
+#         return ctx
+#
+#     fixed_gen = fix_generation_with_llm(
+#         ctx.cfg, ctx.operator, ctx.build_log,
+#         ctx.current_gen.generate_plan,
+#     )
+#     if fixed_gen.llm_used and _has_real_rvv_functions(fixed_gen.generate_plan):
+#         ctx.current_gen = fixed_gen
+#     return ctx

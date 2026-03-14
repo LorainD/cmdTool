@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-
+#NOTE：这个部分是否可以添加skills？关于什么情况可能需要做什么改动，不一定只是append代码，还可能是新建文件。三个prompt要好好斟酌一下
 def patch_locate_prompt(
     symbol: str,
     analysis_json: dict,

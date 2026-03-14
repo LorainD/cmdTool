@@ -39,6 +39,7 @@ from ..core.util import ensure_dir, now_id, write_json, write_text
 # Shared helpers (re-exported from generate.py / inject.py)
 # ---------------------------------------------------------------------------
 
+#NOTE：这个函数作为llm统一的工具不是更好？
 def _extract_gen_json(raw: str) -> dict:
     """Extract JSON from LLM response (handles markdown fences)."""
     raw = raw.strip()
@@ -259,7 +260,7 @@ def locate_patch_points(task: TaskContext) -> list[PatchPoint]:
             ))
         record_trajectory_action("patch_locate", f"Located {len(points)} patch points")
         return points
-    except (LlmError, Exception) as e:
+    except (LlmError, Exception) as e:  #TODO：错误处理应该是重连而不是直接使用fallback
         print(f"[patch] locate failed: {e}, using fallback")
         return [PatchPoint(
             file=f"libavcodec/riscv/{task.target.module}_rvv.S",
@@ -330,12 +331,13 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
                 existing_map[rel] = full.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+#FIXME：改进：这里不应该排除汇编文件，汇编文件也有可能是增量合并
 
     # Collect retry context from previous DEBUG cycles
     build_errors_text: str | None = None
     debug_suggestions: list[str] | None = None
     previous_code: dict | None = None
-
+#TODO：如果generate和debug是耦合的，那么是否加入了知识库中的错误经验？
     if task.all_build_errors:
         build_errors_text = "\n---\n".join(task.all_build_errors[-2:])  # last 2 errors
 
@@ -393,7 +395,7 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
             f"Generated {len(data.get('generated', []))} files",
         )
         return data
-    except (LlmError, Exception) as e:
+    except (LlmError, Exception) as e: #TODO：错误处理应该是重连而不是直接使用placeholder
         print(f"[patch] generate failed: {e}, using placeholder")
         return {
             "generated": [{

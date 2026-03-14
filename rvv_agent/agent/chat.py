@@ -122,7 +122,7 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
 
     ffmpeg_root = task.ffmpeg_root
     symbol = task.target.symbol
-
+#TODO: 这里应该不止是symbol，先由module开始检索
     # Search and select references
     retrieval = select_references(task.cfg, ffmpeg_root, symbol)
     write_text(task.run_dir / "retrieval_raw.txt", retrieval.raw_text + "\n")
@@ -146,6 +146,7 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
     for p in selected_files:
         tag = "[existing-rvv] " if p in retrieval.existing_rvv else ""
         print(f"  {tag}{p}")
+#TODO：这里检索出的existing-rvv似乎在实际使用时并没有出现？并且，如果只供输出，对后续inject时没有参考意义，似乎冗余了。
 
     # User refinement
     if not prompt_yes_no("\n确认进入分析/生成阶段？", default=True):
@@ -183,7 +184,8 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
     task.current_state = TaskState.ANALYZE
     return task
 
-
+#TODO：这个部分的流程应该是根据retrieval和MigrationTarget中，首先在参考文件中找到symbol的源文件，判断其是否有多个function，并更新MigrationTarget中的function。
+#TODO：analyze应该分为两个，第一个只做function的判定，在plan之前；第二个做针对function的分析，在plan之后，做语义分析。
 def handle_analyze(task: TaskContext) -> TaskContext:
     """ANALYZE handler: LLM semantic analysis → migration contract."""
     from .generate import analyze_with_llm
@@ -195,6 +197,8 @@ def handle_analyze(task: TaskContext) -> TaskContext:
     # Reconstruct Discovery for analyze_with_llm
     matches = [Match(**m) for m in retrieval.get("discovery_json", {}).get("matches", [])]
     discovery = Discovery(symbol=symbol, matches=matches)
+#TODO：为什么要重新构建matches和discovery？不就是retrieval的结果吗？
+#TODO：关于function的分析在哪里？analyze应该是针对function的
 
     print("\n正在分析算子实现…")
     # Pass accumulated build errors if any (from DEBUG cycles)
@@ -312,7 +316,7 @@ def _refine_files(cfg: AppConfig, symbol: str, files: list[str],
         if prompt_yes_no("\n确认这份文件列表？", default=True):
             return files
 
-
+#TODO：添加多函数的迁移顺序，并让agent能实际按照plan定义的函数迁移顺序来执行函数迁移
 def handle_plan(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskContext:
     """PLAN handler: generate + refine migration plan."""
     from .generate import llm_plan
@@ -360,7 +364,7 @@ def handle_patch(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskCont
 
     kb_patterns = None
     if kb:
-        found = kb.search_patterns(symbol=task.target.symbol, max_results=3)
+        found = kb.search_patterns(symbol=task.target.symbol, max_results=3)    #TODO：后续需要改进，根据类似的pattern模式来检索（rag？）
         if found:
             from dataclasses import asdict
             kb_patterns = [asdict(p) for p in found]
@@ -440,7 +444,7 @@ def handle_build(task: TaskContext) -> TaskContext:
     )
     aid = task.save_artifact("BUILD", build_artifact, sub_id=build_artifact.run_id)
     task.artifacts.build_run_ids.append(build_artifact.run_id)
-
+#TODO：会出现因为实际没有生成有效内容而checkasm能够通过，导致误判为成功的情况。是否应该添加一个检查？
     if make_result.returncode == 0:
         print(f"\n构建成功 ✓")
         record_trajectory_action("build_success", "Build succeeded")

@@ -14,7 +14,7 @@ from ..core.task import MigrationTarget
 @dataclass(frozen=True)
 class Intent:
     action: str  # chat | migrate
-    symbol: str
+    symbol: str #FIXME：似乎和target中的migrationtarget.symbol重复了，是否可以合并？或者说，这个intent类是否还有存在必要？
     raw: str
     llm_used: bool
     error: str | None = None
@@ -150,3 +150,4 @@ def parse_intent(cfg: AppConfig, user_text: str) -> Intent:
     action = "migrate" if wants_migrate else "chat"
     return Intent(action=action, symbol=sym, raw="no_llm",
                   llm_used=False, target=_build_target(sym) if action == "migrate" else None)
+#FIXME：出现没有llm的情况下，应该重连，结合patch.py，应该重写一个llm的错误处理机制，或者说在chat.py中就处理好这个问题，不要把没有llm的情况传递到后续阶段了

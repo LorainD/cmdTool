@@ -350,7 +350,7 @@ def build_context_from_files(
 # ---------------------------------------------------------------------------
 # Retrieval result + LLM-assisted reference selection
 # ---------------------------------------------------------------------------
-
+#TODO：能否直接用task.py中定义的RetrievalArtifact来取代这个RetrievalResult？目前这种方案像是套了一层
 @dataclass
 class RetrievalResult:
     discovery: Discovery
@@ -360,7 +360,7 @@ class RetrievalResult:
     error: str | None = None
     existing_rvv: list[str] = field(default_factory=list)
 
-
+#TODO：似乎每个agent文件中都有类似的函数，能否将其提取出来，放到util.py中？
 def _extract_retrieval_json(raw: str) -> dict:
     raw = raw.strip()
     if raw.startswith("{") and raw.endswith("}"):
@@ -388,7 +388,7 @@ def _fallback_selection(discovery: Discovery) -> dict:
 
 
 def _scan_existing_rvv(ffmpeg_root: Path, module: str) -> list[str]:
-    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"
+    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"#TODO：BUG！不一定在libavcodec目录下
     if not riscv_dir.exists():
         return []
     module_lower = module.lower()
@@ -445,12 +445,12 @@ def select_references(
 # ---------------------------------------------------------------------------
 # Context-aware stage wrapper
 # ---------------------------------------------------------------------------
-
+#TODO：没有用就注释掉
 def search(ctx: "MigrationContext") -> "MigrationContext":
     """Context-aware search stage.
 
-    Runs :func:`find_symbol` on ``ctx.operator`` / ``ctx.repo_root`` and
-    stores results back into *ctx*.
+    .. deprecated::
+        Pipeline now uses state-machine handlers. Kept for backward compat.
 
     Updates
     -------

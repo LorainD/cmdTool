@@ -172,6 +172,9 @@ class TaskContext:
     # PATCH handler reads this to skip earlier sub-steps on retry.
     rollback_hint: str = ""
 
+    # Build parallelism (0 = auto-detect via os.cpu_count)
+    jobs: int = 0
+
     # Runtime references — not serialised
     cfg: Any = field(default=None, repr=False)
     ffmpeg_root: Path = field(default_factory=lambda: Path("."))
@@ -193,6 +196,7 @@ class TaskContext:
             "artifacts": asdict(self.artifacts),
             "all_build_errors": self.all_build_errors,
             "rollback_hint": self.rollback_hint,
+            "jobs": self.jobs,
         }
         p = self._state_dir() / "task.json"
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -212,6 +216,7 @@ class TaskContext:
             artifacts=artifacts,
             all_build_errors=data.get("all_build_errors", []),
             rollback_hint=data.get("rollback_hint", ""),
+            jobs=data.get("jobs", 0),
             cfg=cfg,
             ffmpeg_root=cfg.ffmpeg.root.expanduser().resolve() if cfg else Path("."),
         )

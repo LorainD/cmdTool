@@ -66,6 +66,9 @@ def run_make_checkasm(cfg: AppConfig, build_dir: Path, jobs: int) -> CmdResult:
 def build(ctx: "MigrationContext") -> "MigrationContext":
     """Context-aware build stage.
 
+    .. deprecated::
+        Pipeline now uses state-machine handlers. Kept for backward compat.
+
     Runs ``configure`` (and ``make checkasm`` if configure succeeds) using
     settings from *ctx*.  Stores logs and the :class:`ExecResult` back into
     *ctx*.

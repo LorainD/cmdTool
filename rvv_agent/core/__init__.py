@@ -14,7 +14,7 @@ from .util import (
     print_llm_error, print_red, print_yellow,
     run_cmd, run_cmd_stream, slug, write_json, write_text,
 )
-from .context import MigrationContext
+from .context import *  # DEPRECATED: MigrationContext 已注释，保留 import 不报错
 from .task import (
     ArtifactIndex, TaskContext, TaskState, MigrationTarget,
     RetrievalArtifact, AnalysisArtifact, PlanArtifact,
@@ -34,8 +34,8 @@ __all__ = [
     "CmdResult", "ensure_dir", "extract_build_errors", "fmt_argv", "now_id",
     "print_llm_error", "print_red", "print_yellow",
     "run_cmd", "run_cmd_stream", "slug", "write_json", "write_text",
-    # context (pipeline)
-    "MigrationContext",
+    # context (pipeline) — DEPRECATED, MigrationContext 已注释
+    # "MigrationContext",
     # task (state machine)
     "ArtifactIndex", "TaskContext", "TaskState", "MigrationTarget",
     "RetrievalArtifact", "AnalysisArtifact", "PlanArtifact",
