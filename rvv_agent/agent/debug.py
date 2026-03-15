@@ -179,6 +179,8 @@ def run_debug_handler(task: TaskContext, kb: KnowledgeBase | None = None) -> Tas
     artifact: DebugArtifact | None = None
     if task.cfg:
         latest_patch_id = task.artifacts.patch_ids[-1] if task.artifacts.patch_ids else None
+        if latest_patch_id and "/" in latest_patch_id:
+            latest_patch_id = latest_patch_id.split("/", 1)[1]
         current_patch = task.load_artifact("PATCH", sub_id=latest_patch_id) if latest_patch_id else None
         artifact = _llm_classify(task.cfg, error_text, current_patch)
 
