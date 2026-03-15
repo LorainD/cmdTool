@@ -5,7 +5,7 @@ architecture.  Each migration stage is an independent handler function.
 Normal chat (non-migrate) still uses a simple multi-turn conversation loop.
 
 State machine flow:
-  INTENT → RETRIEVE → ANALYZE → PLAN → PATCH → BUILD → (TEST) → (KB_UPDATE) → DONE
+  INTENT → RETRIEVE → FUNC_DISCOVER → PLAN → ANALYZE → PATCH → BUILD → (TEST) → (KB_UPDATE) → DONE
   BUILD failure → DEBUG → PATCH (retry)
 """
 from __future__ import annotations
@@ -122,11 +122,25 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
 
     ffmpeg_root = task.ffmpeg_root
     symbol = task.target.symbol
-#TODO: 这里应该不止是symbol，先由module开始检索
-    # Search and select references
+    module = task.target.module
+
+    # 分层检索：先用 module 再用 symbol，合并去重
     retrieval = select_references(task.cfg, ffmpeg_root, symbol)
+    if module and module != symbol:
+        retrieval_mod = select_references(task.cfg, ffmpeg_root, module)
+        # Merge module-level results into symbol-level
+        for k in ("c", "x86", "arm", "riscv", "headers", "makefiles", "checkasm"):
+            sym_list = retrieval.selected_json.get(k, [])
+            mod_list = retrieval_mod.selected_json.get(k, [])
+            merged = list(dict.fromkeys(sym_list + mod_list))
+            retrieval.selected_json[k] = merged
+        # Merge existing RVV
+        for r in retrieval_mod.existing_rvv:
+            if r not in retrieval.existing_rvv:
+                retrieval.existing_rvv.append(r)
+
     write_text(task.run_dir / "retrieval_raw.txt", retrieval.raw_text + "\n")
-    selected = retrieval.selected
+    selected = retrieval.selected_json
 
     def _list(key: str) -> list[str]:
         v = selected.get(key, [])
@@ -146,7 +160,6 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
     for p in selected_files:
         tag = "[existing-rvv] " if p in retrieval.existing_rvv else ""
         print(f"  {tag}{p}")
-#TODO：这里检索出的existing-rvv似乎在实际使用时并没有出现？并且，如果只供输出，对后续inject时没有参考意义，似乎冗余了。
 
     # User refinement
     if not prompt_yes_no("\n确认进入分析/生成阶段？", default=True):
@@ -169,51 +182,90 @@ def handle_retrieve(task: TaskContext) -> TaskContext:
     )
     write_text(task.run_dir / "context.txt", ctx_text)
 
-    # Persist artifact
-    artifact = RetrievalArtifact(
-        discovery_json={
-            "symbol": retrieval.discovery.symbol,
-            "matches": [m.__dict__ for m in retrieval.discovery.matches[:200]],
-        },
-        selected_files=selected_files,
-        code_context=ctx_text,
-    )
-    aid = task.save_artifact("RETRIEVE", artifact)
+    # Persist artifact — reuse the retrieval object, fill in remaining fields
+    retrieval.selected_files = selected_files
+    retrieval.code_context = ctx_text
+    aid = task.save_artifact("RETRIEVE", retrieval)
     task.artifacts.retrieval_id = aid
 
-    task.current_state = TaskState.ANALYZE
+    task.current_state = TaskState.FUNC_DISCOVER
     return task
 
-#TODO：这个部分的流程应该是根据retrieval和MigrationTarget中，首先在参考文件中找到symbol的源文件，判断其是否有多个function，并更新MigrationTarget中的function。
-#TODO：analyze应该分为两个，第一个只做function的判定，在plan之前；第二个做针对function的分析，在plan之后，做语义分析。
+
+def handle_func_discover(task: TaskContext) -> TaskContext:
+    """FUNC_DISCOVER handler: identify all migratable functions in the module."""
+    from .analyze import discover_functions
+
+    retrieval = task.load_artifact("RETRIEVE")
+    code_context = retrieval.get("code_context", "")
+
+    print("\n正在识别可迁移的函数…")
+    artifact = discover_functions(task.cfg, code_context, task.target)
+
+    # Display discovered functions
+    for f in artifact.functions:
+        name = f.get("name", "?")
+        reason = f.get("reason", "")
+        print(f"  - {name}: {reason[:60]}")
+
+    record_trajectory_action(
+        "func_discover",
+        f"Discovered {len(artifact.functions)} function(s)",
+        detail="\n".join(f.get("name", "") for f in artifact.functions),
+    )
+
+    task.save_artifact("FUNC_DISCOVER", artifact)
+    task.current_state = TaskState.PLAN
+    return task
+
+
 def handle_analyze(task: TaskContext) -> TaskContext:
-    """ANALYZE handler: LLM semantic analysis → migration contract."""
-    from .generate import analyze_with_llm
+    """ANALYZE handler: per-function semantic analysis → migration contract.
+
+    On first entry, sets current_function to the first function in the plan's
+    function_order. On subsequent entries (after KB_UPDATE loop-back), the
+    current_function is already advanced by handle_kb_update.
+    """
+    from .analyze import analyze_with_llm
     from .search import Discovery, Match
 
     retrieval = task.load_artifact("RETRIEVE")
-    symbol = task.target.symbol
+    code_context = retrieval.get("code_context", "")
 
-    # Reconstruct Discovery for analyze_with_llm
-    matches = [Match(**m) for m in retrieval.get("discovery_json", {}).get("matches", [])]
-    discovery = Discovery(symbol=symbol, matches=matches)
-#TODO：为什么要重新构建matches和discovery？不就是retrieval的结果吗？
-#TODO：关于function的分析在哪里？analyze应该是针对function的
+    # Determine function_order from plan
+    try:
+        plan_data = task.load_artifact("PLAN")
+        function_order = plan_data.get("function_order", [])
+    except Exception:
+        function_order = []
+    if not function_order:
+        function_order = task.target.functions or [task.target.symbol]
 
-    print("\n正在分析算子实现…")
+    # Set current_function if not already set (first entry)
+    if not task.target.current_function:
+        task.target.current_function = function_order[0] if function_order else task.target.symbol
+
+    cur_func = task.target.current_function
+    func_idx = function_order.index(cur_func) if cur_func in function_order else 0
+    print(f"\n正在分析函数 [{func_idx+1}/{len(function_order)}]: {cur_func}")
+
     # Pass accumulated build errors if any (from DEBUG cycles)
     build_errors_text = "\n---\n".join(task.all_build_errors) if task.all_build_errors else None
+
+    # Build a Discovery object for analyze_with_llm
+    matches = [Match(**m) for m in retrieval.get("discovery_json", {}).get("matches", [])]
+    discovery = Discovery(symbol=task.target.symbol, matches=matches)
 
     analysis = analyze_with_llm(
         task.cfg,
         discovery,
-        context_override=retrieval.get("code_context", ""),
+        context_override=code_context,
         build_errors=build_errors_text,
     )
 
     record_trajectory_action(
         "analyze",
-        f"Analysis complete (llm_used={analysis.llm_used})",
+        f"Analysis complete for {cur_func} (llm_used={analysis.llm_used})",
         detail=analysis.raw_text[:2000],
         event_type="human_output",
     )
@@ -228,7 +280,7 @@ def handle_analyze(task: TaskContext) -> TaskContext:
     task.artifacts.analysis_ids.append(aid)
     write_json(task.run_dir / "analysis.json", analysis.analysis)
 
-    task.current_state = TaskState.PLAN
+    task.current_state = TaskState.PATCH
     return task
 
 
@@ -316,20 +368,25 @@ def _refine_files(cfg: AppConfig, symbol: str, files: list[str],
         if prompt_yes_no("\n确认这份文件列表？", default=True):
             return files
 
-#TODO：添加多函数的迁移顺序，并让agent能实际按照plan定义的函数迁移顺序来执行函数迁移
 def handle_plan(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskContext:
-    """PLAN handler: generate + refine migration plan."""
-    from .generate import llm_plan
+    """PLAN handler: generate + refine migration plan with function ordering."""
+    from .plan import llm_plan
 
     symbol = task.target.symbol
+    functions = task.target.functions or [symbol]
 
     print("\n正在生成迁移计划…")
-    plan = llm_plan(task.cfg, symbol)
+    plan = llm_plan(task.cfg, symbol, functions=functions)
     plan_steps = plan.steps
 
     print("\nPlan：")
     for i, s in enumerate(plan_steps, 1):
         print(f"  {i}. {s}")
+
+    if plan.function_order:
+        print("\n函数迁移顺序：")
+        for i, f in enumerate(plan.function_order, 1):
+            print(f"  {i}. {f}")
 
     refine_history: list[dict] = []
     if not prompt_yes_no("\n确认按该 plan 继续？", default=True):
@@ -347,14 +404,14 @@ def handle_plan(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskConte
     # Persist
     artifact = PlanArtifact(
         steps=plan_steps,
-        function_order=[symbol],
+        function_order=plan.function_order,
         acceptance_criteria={"build_ok": True},
         refine_history=refine_history,
     )
     aid = task.save_artifact("PLAN", artifact)
     task.artifacts.plan_id = aid
 
-    task.current_state = TaskState.PATCH
+    task.current_state = TaskState.ANALYZE
     return task
 
 
@@ -364,7 +421,27 @@ def handle_patch(task: TaskContext, kb: KnowledgeBase | None = None) -> TaskCont
 
     kb_patterns = None
     if kb:
-        found = kb.search_patterns(symbol=task.target.symbol, max_results=3)    #TODO：后续需要改进，根据类似的pattern模式来检索（rag？）
+        # Try tag-based search first using analysis results
+        search_tags: list[str] = []
+        try:
+            analysis = task.load_artifact("ANALYZE")
+            analysis_json = analysis.get("analysis_json", {})
+            # Extract tags from analysis: pattern list + datatype
+            if isinstance(analysis_json.get("pattern"), list):
+                search_tags.extend(str(t) for t in analysis_json["pattern"])
+            elif analysis_json.get("pattern"):
+                search_tags.append(str(analysis_json["pattern"]))
+            if analysis_json.get("datatype") and analysis_json["datatype"] != "unknown":
+                search_tags.append(str(analysis_json["datatype"]))
+        except Exception:
+            pass
+
+        found = []
+        if search_tags:
+            found = kb.search_patterns(tags=search_tags, max_results=3)
+        # Fallback to symbol-based search if tag search yields nothing
+        if not found:
+            found = kb.search_patterns(symbol=task.target.symbol, max_results=3)
         if found:
             from dataclasses import asdict
             kb_patterns = [asdict(p) for p in found]
@@ -444,11 +521,26 @@ def handle_build(task: TaskContext) -> TaskContext:
     )
     aid = task.save_artifact("BUILD", build_artifact, sub_id=build_artifact.run_id)
     task.artifacts.build_run_ids.append(build_artifact.run_id)
-#TODO：会出现因为实际没有生成有效内容而checkasm能够通过，导致误判为成功的情况。是否应该添加一个检查？
+
     if make_result.returncode == 0:
-        print(f"\n构建成功 ✓")
-        record_trajectory_action("build_success", "Build succeeded")
-        task.current_state = TaskState.KB_UPDATE
+        # Validate that generated code contains real RVV instructions
+        from ..core.util import has_real_rvv_instructions
+        has_rvv = False
+        if task.artifacts.patch_ids:
+            try:
+                sub = task.artifacts.patch_ids[-1].split("/")[-1]
+                latest_patch = task.load_artifact("PATCH", sub_id=sub)
+                has_rvv = has_real_rvv_instructions(latest_patch.get("generate_plan", {}))
+            except Exception:
+                pass
+        if not has_rvv:
+            print("\n[WARN] 构建通过但未检测到有效 RVV 指令，可能是空壳实现")
+            record_trajectory_action("build_warn", "Build passed but no real RVV instructions detected")
+            task.current_state = TaskState.DEBUG
+        else:
+            print(f"\n构建成功 ✓")
+            record_trajectory_action("build_success", "Build succeeded")
+            task.current_state = TaskState.KB_UPDATE
     else:
         print(f"\n构建失败 (rc={make_result.returncode})")
         # Save build log with extracted errors
@@ -619,6 +711,25 @@ def handle_kb_update(task: TaskContext, kb: KnowledgeBase | None = None) -> Task
     task.save_artifact("KB_UPDATE", artifact)
     record_trajectory_action("kb_update", f"KB updated: 1 pattern, {len(new_errors)} errors")
 
+    # --- Function-level loop: advance to next function if any ---
+    try:
+        plan_data = task.load_artifact("PLAN")
+        function_order = plan_data.get("function_order", [])
+    except Exception:
+        function_order = []
+
+    cur_func = task.target.current_function
+    if function_order and cur_func in function_order:
+        idx = function_order.index(cur_func)
+        if idx + 1 < len(function_order):
+            next_func = function_order[idx + 1]
+            print(f"\n函数 {cur_func} 迁移完成，继续下一个: {next_func} [{idx+2}/{len(function_order)}]")
+            task.target.current_function = next_func
+            # Clear build errors for the new function cycle
+            task.all_build_errors.clear()
+            task.current_state = TaskState.ANALYZE
+            return task
+
     task.current_state = TaskState.DONE
     return task
 
@@ -708,11 +819,13 @@ def run_chat(cfg: AppConfig) -> int:
         reset_trajectory()
 
         # Register state handlers
+        # Flow: INTENT → RETRIEVE → FUNC_DISCOVER → PLAN → ANALYZE → PATCH → BUILD → ...
         handlers = {
             TaskState.INTENT: handle_intent,
             TaskState.RETRIEVE: handle_retrieve,
-            TaskState.ANALYZE: handle_analyze,
+            TaskState.FUNC_DISCOVER: handle_func_discover,
             TaskState.PLAN: lambda t: handle_plan(t, kb),
+            TaskState.ANALYZE: handle_analyze,
             TaskState.PATCH: lambda t: handle_patch(t, kb),
             TaskState.BUILD: handle_build,
             TaskState.DEBUG: lambda t: handle_debug(t, kb),

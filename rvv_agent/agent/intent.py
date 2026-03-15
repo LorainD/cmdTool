@@ -11,14 +11,18 @@ from ..core.prompts import intent_prompt, system_prompt
 from ..core.task import MigrationTarget
 
 
-@dataclass(frozen=True)
+@dataclass
 class Intent:
     action: str  # chat | migrate
-    symbol: str #FIXME：似乎和target中的migrationtarget.symbol重复了，是否可以合并？或者说，这个intent类是否还有存在必要？
     raw: str
     llm_used: bool
     error: str | None = None
     target: MigrationTarget | None = None
+
+    @property
+    def symbol(self) -> str:
+        """Derived from target to avoid duplicate storage."""
+        return self.target.symbol if self.target else ""
 
     @property
     def module(self) -> str:
@@ -43,15 +47,10 @@ class Intent:
         return [self.symbol]
 
 
-def _extract_json(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("{") and raw.endswith("}"):
-        return json.loads(raw)
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(raw[start : end + 1])
-    return json.loads(raw)
+from ..core.util import extract_json_from_llm
+
+# Alias for backward compat within this module
+_extract_json = extract_json_from_llm
 
 
 _DOT_IDENT = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
@@ -115,10 +114,10 @@ def parse_intent(cfg: AppConfig, user_text: str) -> Intent:
     sym = _extract_symbol_heuristic(user_text)
 
     if sym and user_text.strip() == sym:
-        return Intent(action="migrate", symbol=sym, raw="heuristic:symbol_only",
+        return Intent(action="migrate", raw="heuristic:symbol_only",
                       llm_used=False, target=_build_target(sym))
     if wants_migrate and sym:
-        return Intent(action="migrate", symbol=sym, raw="heuristic:migrate",
+        return Intent(action="migrate", raw="heuristic:migrate",
                       llm_used=False, target=_build_target(sym))
 
     if api_key_present(cfg.llm):
@@ -136,18 +135,18 @@ def parse_intent(cfg: AppConfig, user_text: str) -> Intent:
             if wants_migrate and action != "migrate":
                 action = "migrate"
             target = _build_target(symbol) if action == "migrate" else None
-            return Intent(action=action, symbol=symbol, raw=raw,
+            return Intent(action=action, raw=raw,
                           llm_used=True, target=target)
         except LlmError as e:
             action = "migrate" if wants_migrate else "chat"
-            return Intent(action=action, symbol=sym, raw=str(e),
+            return Intent(action=action, raw=str(e),
                           llm_used=False, error=str(e), target=_build_target(sym) if action == "migrate" else None)
         except Exception as e:
             action = "migrate" if wants_migrate else "chat"
-            return Intent(action=action, symbol=sym, raw=repr(e),
+            return Intent(action=action, raw=repr(e),
                           llm_used=False, error=repr(e), target=_build_target(sym) if action == "migrate" else None)
 
     action = "migrate" if wants_migrate else "chat"
-    return Intent(action=action, symbol=sym, raw="no_llm",
+    return Intent(action=action, raw="no_llm",
                   llm_used=False, target=_build_target(sym) if action == "migrate" else None)
 #FIXME：出现没有llm的情况下，应该重连，结合patch.py，应该重写一个llm的错误处理机制，或者说在chat.py中就处理好这个问题，不要把没有llm的情况传递到后续阶段了

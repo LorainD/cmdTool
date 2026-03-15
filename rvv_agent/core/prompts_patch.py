@@ -28,6 +28,20 @@ def patch_locate_prompt(
 ## 代码上下文
 {code_context[:6000]}
 
+## 锚点定位技能
+你需要识别以下类型的锚点：
+- **函数声明/定义**：C 源文件中的函数签名行，用于确定 RVV 替代目标
+- **#include 行**：头文件中需要添加 RVV 函数声明的位置
+- **条件编译块**：`#if HAVE_RVV` / `#if HAVE_RV` 块，用于注册 RVV 实现
+- **Makefile 规则**：`OBJS-$(CONFIG_...)` 块，用于添加新的 .o 目标
+- **汇编文件末尾**：已有 .S 文件的最后一个 `.size` 指令之后，用于追加新函数
+
+不同文件类型的典型插入位置：
+- **.S 汇编文件**：在文件末尾（最后一个 .size 之后）追加新函数，或创建新文件
+- **init.c 注册文件**：在对应的 `#if HAVE_RVV` 条件块内，已有赋值语句之后
+- **Makefile**：在对应的 `OBJS-$(CONFIG_...)` 块末尾追加 .o 目标
+- **头文件 (.h)**：在已有的函数声明列表末尾
+
 ## 任务
 分析上述信息，确定需要修改/创建的文件及精确插入位置。
 
@@ -62,9 +76,23 @@ def patch_design_prompt(
 {json.dumps(patch_points, ensure_ascii=False, indent=2)}
 {kb_section}
 
+## 变更类型技能
+你可以使用以下变更类型，每种类型有不同的语义：
+
+- **create_file**: 创建全新文件
+  示例: 创建 `libavcodec/riscv/sbrdsp_rvv.S`（新的 RVV 汇编实现）
+- **append_function**: 在已有文件末尾追加新函数
+  示例: 在已有的 `sbrdsp_rvv.S` 末尾追加 `ff_sbr_neg_odd_64_rvv` 函数
+- **inject_init**: 在 init.c 的条件编译块内注入函数指针赋值
+  示例: 在 `ff_sbrdsp_init_riscv()` 的 `#if HAVE_RVV` 块内添加 `c->neg_odd_64 = ff_sbr_neg_odd_64_rvv;`
+- **inject_header**: 在头文件中添加函数声明
+  示例: 在 `sbrdsp.h` 中添加 `void ff_sbr_neg_odd_64_rvv(INTFLOAT *x, int len);`
+- **inject_makefile**: 在 Makefile 的 OBJS 列表中添加 .o 目标
+  示例: 在 `OBJS-$(CONFIG_AAC_DECODER)` 块末尾添加 `sbrdsp_rvv.o`
+
 ## 任务
 基于以上信息，设计变更方案。对每个变更点，说明:
-- type: "create_file" | "append_function" | "inject_code" | "add_build_rule"
+- type: 上述变更类型之一
 - file: 目标文件路径
 - description: 变更内容描述
 - code_items: 需要生成的代码项列表（函数名/宏名/规则名）
@@ -83,6 +111,7 @@ def patch_generate_prompt(
     build_errors: str | None = None,
     debug_suggestions: list[str] | None = None,
     previous_code: dict | None = None,
+    kb_errors: list[dict] | None = None,
 ) -> str:
     """Prompt for Step 3: generate actual code based on design.
 
@@ -96,6 +125,15 @@ def patch_generate_prompt(
         for path, content in existing_files_map.items():
             parts.append(f"### {path}\n```\n{content[:3000]}\n```")
         existing_section = "\n## 现有文件内容（需要做增量合并）\n" + "\n".join(parts)
+
+    kb_section = ""
+    if kb_errors:
+        kb_parts = []
+        for er in kb_errors:
+            kb_parts.append(
+                f"- [{er.get('error_class', '?')}] {er.get('pattern', '')[:80]} → 修复: {er.get('fix_strategy', '')}"
+            )
+        kb_section = "\n## 历史错误经验（来自知识库，请避免重复这些错误）\n" + "\n".join(kb_parts) + "\n"
 
     fix_section = ""
     if build_errors:
@@ -121,12 +159,19 @@ def patch_generate_prompt(
 
 ## 变更设计
 {json.dumps(design, ensure_ascii=False, indent=2)}
-{existing_section}{fix_section}
+{existing_section}{kb_section}{fix_section}
 
 ## 要求
 1. .S 文件：使用 RISC-V Vector (RVV) 汇编，遵循 FFmpeg 汇编风格
+   - 标准循环模板：`vsetvli` 设置向量长度 → `vle/vlse` 加载 → 计算指令 → `vse/vsse` 存储 → 更新指针 → 循环
+   - 函数结构：`.text` / `.option arch, +v` / `.globl func_name` / `.type func_name, @function` / `func_name:` / ... / `ret` / `.size func_name, .-func_name`
+   - 尾部处理：使用 `vsetvli` 的自然尾部收敛，无需额外 mask（除非算法要求）
+   - 注意数据类型宽度：float32 用 `vle32/vse32`，int16 用 `vle16/vse16`，以此类推
 2. init.c 文件：注册 RVV 实现到 DSP context
+   - 标准模板：`if (flags & AV_CPU_FLAG_RVV_I32) {{ c->func_name = ff_func_name_rvv; }}`
+   - 仅注册当前迁移的函数，不要注册尚未实现的函数（避免链接错误）
 3. Makefile：添加新文件到编译单元
+   - 标准格式：`OBJS-$(CONFIG_XXX) += module_rvv.o`（仅在创建新 .S 文件时需要）
 4. 对已有文件做增量修改（不要重写整个文件，只输出需要添加的代码片段）
 
 严格输出 JSON:

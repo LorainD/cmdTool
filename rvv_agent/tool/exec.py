@@ -60,40 +60,29 @@ def run_make_checkasm(cfg: AppConfig, build_dir: Path, jobs: int) -> CmdResult:
 
 
 # ---------------------------------------------------------------------------
-# Context-aware stage wrapper
+# Context-aware stage wrapper (DEPRECATED — 已被状态机架构替代)
 # ---------------------------------------------------------------------------
-
-def build(ctx: "MigrationContext") -> "MigrationContext":
-    """Context-aware build stage.
-
-    .. deprecated::
-        Pipeline now uses state-machine handlers. Kept for backward compat.
-
-    Runs ``configure`` (and ``make checkasm`` if configure succeeds) using
-    settings from *ctx*.  Stores logs and the :class:`ExecResult` back into
-    *ctx*.
-
-    Updates
-    -------
-    ``ctx.exec_result``      — :class:`ExecResult` with sub-command results.
-    ``ctx.build_log``        — combined configure stdout+stderr.
-    ``ctx.checkasm_output``  — combined make-checkasm stdout+stderr (if run).
-    """
-    from ..core.util import ensure_dir as _ensure_dir
-
-    build_dir = ctx.repo_root / ctx.cfg.ffmpeg.build_dir
-    _ensure_dir(build_dir)
-
-    if ctx.exec_result is None:
-        ctx.exec_result = ExecResult()
-
-    configure_result = run_configure(ctx.cfg, ctx.repo_root, build_dir)
-    ctx.exec_result.configure = configure_result
-    ctx.build_log = (configure_result.stdout or "") + (configure_result.stderr or "")
-
-    if configure_result.returncode == 0:
-        make_result = run_make_checkasm(ctx.cfg, build_dir, ctx.jobs)
-        ctx.exec_result.make_checkasm = make_result
-        ctx.checkasm_output = (make_result.stdout or "") + (make_result.stderr or "")
-
-    return ctx
+# def build(ctx: "MigrationContext") -> "MigrationContext":
+#     """Context-aware build stage.
+#
+#     .. deprecated::
+#         Pipeline now uses state-machine handlers. Kept for backward compat.
+#     """
+#     from ..core.util import ensure_dir as _ensure_dir
+#
+#     build_dir = ctx.repo_root / ctx.cfg.ffmpeg.build_dir
+#     _ensure_dir(build_dir)
+#
+#     if ctx.exec_result is None:
+#         ctx.exec_result = ExecResult()
+#
+#     configure_result = run_configure(ctx.cfg, ctx.repo_root, build_dir)
+#     ctx.exec_result.configure = configure_result
+#     ctx.build_log = (configure_result.stdout or "") + (configure_result.stderr or "")
+#
+#     if configure_result.returncode == 0:
+#         make_result = run_make_checkasm(ctx.cfg, build_dir, ctx.jobs)
+#         ctx.exec_result.make_checkasm = make_result
+#         ctx.checkasm_output = (make_result.stdout or "") + (make_result.stderr or "")
+#
+#     return ctx

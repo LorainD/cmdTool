@@ -39,42 +39,12 @@ from ..core.util import ensure_dir, now_id, write_json, write_text
 # Shared helpers (re-exported from generate.py / inject.py)
 # ---------------------------------------------------------------------------
 
-#NOTE：这个函数作为llm统一的工具不是更好？
-def _extract_gen_json(raw: str) -> dict:
-    """Extract JSON from LLM response (handles markdown fences)."""
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
-        raw = raw.strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end > start:
-        return json.loads(raw[start: end + 1])
-    return json.loads(raw)
+from ..core.util import extract_json_from_llm, snippet_exists, snapshot_file
 
-
-def _snippet_already_present(existing: str, snippet: str) -> bool:
-    """Check if the meaningful lines of snippet are already in existing."""
-    for line in snippet.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith(("//", "/*", "#", ";")):
-            return stripped in existing
-    return False
-
-
-def _snapshot(apply_dir: Path, src_file: Path) -> None:
-    """Save a copy of src_file into apply_dir/snapshot/ (post-injection, for audit)."""
-    try:
-        snap_dir = apply_dir / "snapshot"
-        parts = src_file.parts
-        rel = Path(*parts[-3:]) if len(parts) >= 3 else Path(src_file.name)
-        snap = snap_dir / rel
-        ensure_dir(snap.parent)
-        write_text(snap, src_file.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        pass
+# Aliases for backward compat within this module
+_extract_gen_json = extract_json_from_llm
+_snippet_already_present = snippet_exists
+_snapshot = snapshot_file
 
 
 def _save_pre_injection(apply_dir: Path, dst: Path) -> None:
@@ -313,7 +283,8 @@ def design_patch(task: TaskContext, points: list[PatchPoint],
 # Step 3: Generate code
 # ---------------------------------------------------------------------------
 
-def generate_code(task: TaskContext, design: PatchDesign) -> dict:
+def generate_code(task: TaskContext, design: PatchDesign,
+                   kb_errors: list[dict] | None = None) -> dict:
     """LLM generates actual code based on the design. Returns generate_plan dict.
 
     On retry (after DEBUG), includes build errors, debug suggestions, and the
@@ -323,15 +294,32 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
     retrieval = task.load_artifact("RETRIEVE")
 
     # Build existing_files_map for incremental merge
+    # Include .S files so LLM can see existing RVV implementations
     existing_map: dict[str, str] = {}
     for rel in retrieval.get("selected_files", []):
         full = task.ffmpeg_root / rel
-        if full.exists() and full.is_file() and not rel.endswith(".S"):
+        if full.exists() and full.is_file():
             try:
-                existing_map[rel] = full.read_text(encoding="utf-8", errors="replace")
+                content = full.read_text(encoding="utf-8", errors="replace")
+                # For large .S files, only include relevant portions
+                if rel.endswith(".S") and len(content) > 6000:
+                    content = content[:6000] + "\n... (truncated)"
+                existing_map[rel] = content
             except Exception:
                 pass
-#FIXME：改进：这里不应该排除汇编文件，汇编文件也有可能是增量合并
+
+    # Also include existing RVV files from retrieval
+    for rel in retrieval.get("existing_rvv", []):
+        if rel not in existing_map:
+            full = task.ffmpeg_root / rel
+            if full.exists() and full.is_file():
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                    if len(content) > 6000:
+                        content = content[:6000] + "\n... (truncated)"
+                    existing_map[rel] = content
+                except Exception:
+                    pass
 
     # Collect retry context from previous DEBUG cycles
     build_errors_text: str | None = None
@@ -371,6 +359,7 @@ def generate_code(task: TaskContext, design: PatchDesign) -> dict:
             build_errors=build_errors_text,
             debug_suggestions=debug_suggestions,
             previous_code=previous_code,
+            kb_errors=kb_errors,
         )),
     ]
     try:
@@ -566,8 +555,24 @@ def run_patch_stage(task: TaskContext, kb_patterns: list[dict] | None = None) ->
         print(f"\n[PATCH] Step 2/4: 复用上次设计方案")
 
     # --- Step 3: Generate (always re-run when entering PATCH) ---
+    # Retrieve KB error records for the current symbol
+    kb_error_dicts: list[dict] | None = None
+    if task.all_build_errors:
+        try:
+            from ..memory.knowledge_base import KnowledgeBase
+            from dataclasses import asdict as _asdict
+            kb = KnowledgeBase()
+            kb.load()
+            error_records = kb.search_errors(keyword=task.target.symbol, max_results=5)
+            if not error_records:
+                error_records = kb.search_errors(max_results=3)
+            if error_records:
+                kb_error_dicts = [_asdict(er) for er in error_records]
+        except Exception:
+            pass
+
     print("\n[PATCH] Step 3/4: 生成代码…（可能需要 20-60 秒）")
-    gen_plan = generate_code(task, design)
+    gen_plan = generate_code(task, design, kb_errors=kb_error_dicts)
     for item in gen_plan.get("generated", []):
         print(f"  → {item.get('target_path')} ({item.get('action')})")
 

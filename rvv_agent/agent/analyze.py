@@ -1,7 +1,8 @@
 """agent.analyze — Analysis Agent
 
 负责：
-  - LLM 语义分析（AnalysisResult / analyze_with_llm）
+  - 函数发现（discover_functions）— FUNC_DISCOVER 阶段
+  - LLM 语义分析（AnalysisResult / analyze_with_llm）— ANALYZE 阶段
 """
 from __future__ import annotations
 
@@ -10,7 +11,9 @@ from dataclasses import dataclass
 
 from ..core.config import AppConfig
 from ..core.llm import LlmError, LlmMessage, chat_completion
-from ..core.prompts import analysis_prompt, system_prompt
+from ..core.prompts import analysis_prompt, function_discovery_prompt, system_prompt
+from ..core.task import FuncDiscoverArtifact, MigrationTarget
+from ..core.util import extract_json_from_llm
 from .search import Discovery, build_llm_context, group_files
 
 
@@ -20,6 +23,44 @@ class AnalysisResult:
     raw_text: str
     llm_used: bool
     error: str | None = None
+
+
+def discover_functions(
+    cfg: AppConfig,
+    code_context: str,
+    target: MigrationTarget,
+) -> FuncDiscoverArtifact:
+    """FUNC_DISCOVER: identify all migratable functions for the target symbol.
+
+    Calls LLM to analyze code context and discover function signatures.
+    Updates target.functions with the discovered function names.
+    """
+    messages = [
+        LlmMessage(role="system", content=system_prompt()),
+        LlmMessage(role="user", content=function_discovery_prompt(target.symbol, code_context)),
+    ]
+    try:
+        raw = chat_completion(cfg.llm, messages, max_tokens=1200, stage="func_discover")
+        data = extract_json_from_llm(raw)
+        functions = data.get("functions", [])
+        # Update target.functions with discovered names
+        func_names = [str(f.get("name", "")).strip() for f in functions if f.get("name")]
+        if func_names:
+            target.functions = func_names
+        return FuncDiscoverArtifact(
+            functions=functions,
+            raw_text=raw,
+            llm_used=True,
+        )
+    except (LlmError, Exception) as e:
+        # Fallback: use the symbol itself as the only function
+        if not target.functions:
+            target.functions = [target.symbol]
+        return FuncDiscoverArtifact(
+            functions=[{"name": target.symbol, "reason": "fallback"}],
+            raw_text=str(e),
+            llm_used=False,
+        )
 
 
 def _fallback_analysis(discovery: Discovery) -> dict:

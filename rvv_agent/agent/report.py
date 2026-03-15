@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 from ..core.util import CmdResult, ensure_dir, fmt_argv, write_json, write_text
 from ..tool.exec import ExecResult
-from .generate import AnalysisResult, Plan
+from .analyze import AnalysisResult
+from .plan import Plan
 from .search import Discovery, group_files
 
 if TYPE_CHECKING:

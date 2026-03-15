@@ -242,3 +242,81 @@ def extract_build_errors(output: str, tail_lines: int = 60, max_chars: int = 400
     if len(result) > max_chars:
         result = result[-max_chars:]
     return result
+
+
+# ---------------------------------------------------------------------------
+# LLM response JSON extraction (shared across all agent modules)
+# ---------------------------------------------------------------------------
+
+def extract_json_from_llm(raw: str) -> dict:
+    """Extract a JSON object from an LLM response.
+
+    Handles markdown fences, leading/trailing text, etc.
+    """
+    raw = raw.strip()
+    # Strip markdown code fences
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        if raw.endswith("```"):
+            raw = raw.rsplit("```", 1)[0]
+        raw = raw.strip()
+    # Try direct parse first
+    if raw.startswith("{") and raw.endswith("}"):
+        return json.loads(raw)
+    # Find outermost braces
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(raw[start: end + 1])
+    return json.loads(raw)
+
+
+def snippet_exists(existing: str, snippet: str) -> bool:
+    """Check if the meaningful lines of *snippet* are already in *existing*."""
+    for line in snippet.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("//", "/*", "#", ";")):
+            return stripped in existing
+    return False
+
+
+def snapshot_file(apply_dir: Path, src_file: Path) -> None:
+    """Save a copy of *src_file* into ``apply_dir/snapshot/`` for audit."""
+    try:
+        snap_dir = apply_dir / "snapshot"
+        parts = src_file.parts
+        rel = Path(*parts[-3:]) if len(parts) >= 3 else Path(src_file.name)
+        snap = snap_dir / rel
+        ensure_dir(snap.parent)
+        write_text(snap, src_file.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# RVV code validity check
+# ---------------------------------------------------------------------------
+
+_RVV_INSTRUCTION_RE = _re.compile(
+    r"\b(vset[iv]?vli?|vle?\d+|vse?\d+|vadd|vsub|vmul|vdiv|vfadd|vfsub|vfmul|vfdiv|"
+    r"vfneg|vand|vor|vxor|vsll|vsrl|vsra|vmerge|vmv|vlse?\d+|vsse?\d+|"
+    r"vslide|vredsum|vredmax|vredmin|vfredosum|vfwredosum|vmacc|vnmsac|"
+    r"vfmacc|vfnmacc|vfmsac|vfnmsac|vwmul|vwmacc|vzext|vsext|vncvt|"
+    r"vnsrl|vnsra|vsetvli|vsetivli)\b",
+    _re.IGNORECASE,
+)
+
+
+def has_real_rvv_instructions(generate_plan: dict) -> bool:
+    """Check if a generate_plan contains actual RVV vector instructions.
+
+    Returns False if the generated code is just a placeholder (e.g. only 'ret').
+    """
+    for item in generate_plan.get("generated", []):
+        content = item.get("content", "")
+        target = item.get("target_path", "")
+        if not target.endswith(".S"):
+            continue
+        if _RVV_INSTRUCTION_RE.search(content):
+            return True
+    return False

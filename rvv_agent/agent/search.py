@@ -350,26 +350,12 @@ def build_context_from_files(
 # ---------------------------------------------------------------------------
 # Retrieval result + LLM-assisted reference selection
 # ---------------------------------------------------------------------------
-#TODO：能否直接用task.py中定义的RetrievalArtifact来取代这个RetrievalResult？目前这种方案像是套了一层
-@dataclass
-class RetrievalResult:
-    discovery: Discovery
-    selected: dict
-    raw_text: str
-    llm_used: bool
-    error: str | None = None
-    existing_rvv: list[str] = field(default_factory=list)
+from ..core.task import RetrievalArtifact
 
-#TODO：似乎每个agent文件中都有类似的函数，能否将其提取出来，放到util.py中？
-def _extract_retrieval_json(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("{") and raw.endswith("}"):
-        return json.loads(raw)
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(raw[start : end + 1])
-    return json.loads(raw)
+from ..core.util import extract_json_from_llm
+
+# Alias for backward compat within this module
+_extract_retrieval_json = extract_json_from_llm
 
 
 def _fallback_selection(discovery: Discovery) -> dict:
@@ -388,14 +374,16 @@ def _fallback_selection(discovery: Discovery) -> dict:
 
 
 def _scan_existing_rvv(ffmpeg_root: Path, module: str) -> list[str]:
-    riscv_dir = ffmpeg_root / "libavcodec" / "riscv"#TODO：BUG！不一定在libavcodec目录下
-    if not riscv_dir.exists():
-        return []
+    """Scan all lib*/riscv directories for existing RVV files matching module."""
     module_lower = module.lower()
     found: list[str] = []
-    for f in sorted(riscv_dir.iterdir()):
-        if f.is_file() and module_lower in f.name.lower():
-            found.append(str(f.relative_to(ffmpeg_root)).replace("\\", "/"))
+    for lib_dir in sorted(ffmpeg_root.glob("lib*")):
+        riscv_dir = lib_dir / "riscv"
+        if not riscv_dir.is_dir():
+            continue
+        for f in sorted(riscv_dir.iterdir()):
+            if f.is_file() and module_lower in f.name.lower():
+                found.append(str(f.relative_to(ffmpeg_root)).replace("\\", "/"))
     return found
 
 
@@ -403,7 +391,7 @@ def select_references(
     cfg: AppConfig,
     ffmpeg_root: Path,
     intent_or_symbol: "Intent | str",
-) -> RetrievalResult:
+) -> RetrievalArtifact:
     """LLM 辅助筛选参考文件。"""
     if isinstance(intent_or_symbol, str):
         symbol = intent_or_symbol
@@ -421,6 +409,11 @@ def select_references(
         discovery = find_symbol(ffmpeg_root, symbol)
     grouped = group_files(discovery)
 
+    discovery_json = {
+        "symbol": discovery.symbol,
+        "matches": [m.__dict__ for m in discovery.matches[:200]],
+    }
+
     messages = [
         LlmMessage(role="system", content=system_prompt()),
         LlmMessage(role="user", content=retrieval_prompt(symbol, grouped, discovery.matches[:120])),
@@ -430,35 +423,51 @@ def select_references(
         data = _extract_retrieval_json(raw)
         if not isinstance(data, dict):
             raise ValueError("retrieval json is not dict")
-        return RetrievalResult(discovery=discovery, selected=data, raw_text=raw,
-                               llm_used=True, existing_rvv=existing_rvv)
+        return RetrievalArtifact(
+            discovery_json=discovery_json,
+            selected_json=data,
+            raw_text=raw,
+            llm_used=True,
+            existing_rvv=existing_rvv,
+        )
     except LlmError as e:
         fb = _fallback_selection(discovery)
-        return RetrievalResult(discovery=discovery, selected=fb, raw_text=str(e),
-                               llm_used=False, error=str(e), existing_rvv=existing_rvv)
+        return RetrievalArtifact(
+            discovery_json=discovery_json,
+            selected_json=fb,
+            raw_text=str(e),
+            llm_used=False,
+            error=str(e),
+            existing_rvv=existing_rvv,
+        )
     except Exception as e:
         fb = _fallback_selection(discovery)
-        return RetrievalResult(discovery=discovery, selected=fb, raw_text=repr(e),
-                               llm_used=False, error=repr(e), existing_rvv=existing_rvv)
+        return RetrievalArtifact(
+            discovery_json=discovery_json,
+            selected_json=fb,
+            raw_text=repr(e),
+            llm_used=False,
+            error=repr(e),
+            existing_rvv=existing_rvv,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Context-aware stage wrapper
+# Context-aware stage wrapper (DEPRECATED — 已被状态机架构替代)
 # ---------------------------------------------------------------------------
-#TODO：没有用就注释掉
-def search(ctx: "MigrationContext") -> "MigrationContext":
-    """Context-aware search stage.
-
-    .. deprecated::
-        Pipeline now uses state-machine handlers. Kept for backward compat.
-
-    Updates
-    -------
-    ``ctx.discovery``   — full :class:`Discovery` result.
-    ``ctx.source_file`` — primary source file path (first match, if any).
-    """
-    disc = find_symbol(ctx.repo_root, ctx.operator)
-    ctx.discovery = disc
-    if disc.matches:
-        ctx.source_file = disc.matches[0].file
-    return ctx
+# def search(ctx: "MigrationContext") -> "MigrationContext":
+#     """Context-aware search stage.
+#
+#     .. deprecated::
+#         Pipeline now uses state-machine handlers. Kept for backward compat.
+#
+#     Updates
+#     -------
+#     ``ctx.discovery``   — full :class:`Discovery` result.
+#     ``ctx.source_file`` — primary source file path (first match, if any).
+#     """
+#     disc = find_symbol(ctx.repo_root, ctx.operator)
+#     ctx.discovery = disc
+#     if disc.matches:
+#         ctx.source_file = disc.matches[0].file
+#     return ctx

@@ -23,6 +23,7 @@ from typing import Any
 class TaskState(Enum):
     INTENT = "INTENT"
     RETRIEVE = "RETRIEVE"
+    FUNC_DISCOVER = "FUNC_DISCOVER"
     ANALYZE = "ANALYZE"
     PLAN = "PLAN"
     PATCH = "PATCH"
@@ -42,7 +43,8 @@ class MigrationTarget:
     """What to migrate: module + symbol, with optional function list."""
     module: str                                         # e.g. "sbrdsp"
     symbol: str                                         # e.g. "sbrdsp.neg_odd_64"
-    functions: list[str] = field(default_factory=list)  # filled in ANALYZE stage
+    functions: list[str] = field(default_factory=list)  # filled in FUNC_DISCOVER stage
+    current_function: str = ""                          # current function being migrated
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +56,20 @@ class RetrievalArtifact:
     """Output of RETRIEVE stage."""
     discovery_json: dict = field(default_factory=dict)
     selected_files: list[str] = field(default_factory=list)
+    selected_json: dict = field(default_factory=dict)   # raw LLM selection result
     code_context: str = ""
+    existing_rvv: list[str] = field(default_factory=list)
+    raw_text: str = ""
+    llm_used: bool = False
+    error: str | None = None
+
+
+@dataclass
+class FuncDiscoverArtifact:
+    """Output of FUNC_DISCOVER stage — discovered functions for migration."""
+    functions: list[dict] = field(default_factory=list)  # [{name, signature, file, line}]
+    raw_text: str = ""
+    llm_used: bool = False
 
 
 @dataclass

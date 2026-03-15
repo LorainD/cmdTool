@@ -6,49 +6,59 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..core.config import AppConfig
 from ..core.llm import LlmError, LlmMessage, chat_completion
 from ..core.prompts import plan_prompt, system_prompt
+from ..core.util import extract_json_from_llm
 
 
 @dataclass
 class Plan:
-    steps: list[str]
+    steps: list[str] = field(default_factory=list)
+    function_order: list[str] = field(default_factory=list)  # 按依赖排序的函数迁移顺序
 
 
-def fixed_plan(symbol: str) -> Plan:
+def fixed_plan(symbol: str, functions: list[str] | None = None) -> Plan:
     """LLM 不可用时的硬编码兜底计划。"""
-    return Plan(steps=[
-        f"意图解析：迁移 {symbol}",
-        "定位 C 实现",
-        "定位 x86 / ARM 参考实现",
-        "语义抽象（结构化任务描述 JSON）",
-        f"调用 LLM 生成 {symbol} 的 RVV asm + init + Makefile patch（落到 runs/）",
-        "(可选）把补丁应用到 workspace",
-        "(可选）交叉 configure + build checkasm",
-        "生成 run 报告（轨迹、输入输出、命令、摘要）",
-    ])
+    return Plan(
+        steps=[
+            f"意图解析：迁移 {symbol}",
+            "定位 C 实现",
+            "定位 x86 / ARM 参考实现",
+            "语义抽象（结构化任务描述 JSON）",
+            f"调用 LLM 生成 {symbol} 的 RVV asm + init + Makefile patch（落到 runs/）",
+            "(可选）把补丁应用到 workspace",
+            "(可选）交叉 configure + build checkasm",
+            "生成 run 报告（轨迹、输入输出、命令、摘要）",
+        ],
+        function_order=functions or [symbol],
+    )
 
 
-def llm_plan(cfg: AppConfig, symbol: str) -> Plan:
+def llm_plan(cfg: AppConfig, symbol: str, functions: list[str] | None = None) -> Plan:
     """调用 LLM 生成针对 symbol 的迁移计划，失败时回退到 fixed_plan。"""
     messages = [
         LlmMessage(role="system", content=system_prompt()),
-        LlmMessage(role="user", content=plan_prompt(symbol)),
+        LlmMessage(role="user", content=plan_prompt(symbol, functions)),
     ]
     try:
-        raw = chat_completion(cfg.llm, messages, max_tokens=600, stage="plan")
-        raw = raw.strip()
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end > start:
-            raw = raw[start : end + 1]
-        data = json.loads(raw)
+        raw = chat_completion(cfg.llm, messages, max_tokens=800, stage="plan")
+        data = extract_json_from_llm(raw)
         steps = data.get("steps", [])
         if not isinstance(steps, list) or not steps:
             raise ValueError("empty steps")
-        return Plan(steps=[str(s).strip() for s in steps if str(s).strip()])
+        func_order = data.get("function_order", [])
+        if not isinstance(func_order, list):
+            func_order = []
+        func_order = [str(f).strip() for f in func_order if str(f).strip()]
+        # Fallback: use discovered functions or symbol
+        if not func_order:
+            func_order = functions or [symbol]
+        return Plan(
+            steps=[str(s).strip() for s in steps if str(s).strip()],
+            function_order=func_order,
+        )
     except (LlmError, Exception):
-        return fixed_plan(symbol)
+        return fixed_plan(symbol, functions)

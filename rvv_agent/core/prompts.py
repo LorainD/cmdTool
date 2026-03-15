@@ -219,12 +219,25 @@ anchor_hint（生成器提供的插入位置提示）：
 """
 
 
-def plan_prompt(symbol: str) -> str:
-    return f"""你是 FFmpeg RVV SIMD 迁移助手。请为迁移算子 {symbol} 生成一份具体的迁移计划。
+def plan_prompt(symbol: str, functions: list[str] | None = None) -> str:
+    func_section = ""
+    if functions:
+        func_list = "\n".join(f"- {f}" for f in functions)
+        func_section = f"""
+已发现的待迁移函数：
+{func_list}
+"""
 
+    return f"""你是 FFmpeg RVV SIMD 迁移助手。请为迁移算子 {symbol} 生成一份具体的迁移计划。
+{func_section}
 要求：
 - 步骤应具体针对 {symbol}，而不是泛泛的模板
 - 必须包含：定位 C 实现、定位参考实现（x86/ARM）、生成 RVV 实现、如何集成到构建系统、运行 checkasm 验证
+- 必须输出 function_order：按依赖关系排序的函数迁移顺序
+  - .S 汇编函数优先
+  - init.c 注册函数最后
+  - Makefile 修改最后
+- 注意：每个函数迁移完成后才注册到 init.c，避免声明了接口但没有实现导致链接错误
 - 输出严格 JSON（不要额外文字）
 
 输出格式：
@@ -234,6 +247,7 @@ def plan_prompt(symbol: str) -> str:
     "步骤1",
     "步骤2"
   ],
+  "function_order": ["func1_rvv", "func2_rvv"],
   "notes": "..."
 }}
 """
@@ -334,4 +348,46 @@ def build_fix_prompt(
   "files": [{{"path": "...", "content": "..."}}, ...],
   "patches": [{{"path": "...", "diff": "..."}}, ...]
 }}
+"""
+
+
+def function_discovery_prompt(symbol: str, code_context: str) -> str:
+    """Prompt for FUNC_DISCOVER stage: identify all functions to migrate."""
+    return f"""你是 FFmpeg 源码分析专家。
+
+目标模块/算子: {symbol}
+
+## 任务
+分析下面的代码上下文，找出所有属于 {symbol} 模块且适合迁移到 RVV (RISC-V Vector) 的 C 函数。
+
+判定规则：
+- 函数必须包含可向量化的计算（循环中的数组操作、SIMD 风格运算等）
+- 排除纯控制流函数（init、alloc、free 等）
+- 排除已有 RVV 实现的函数
+- 如果 x86/ARM 参考实现中有对应的 SIMD 版本，说明该函数适合迁移
+
+对每个发现的函数，输出：
+- name: 函数名（如 ff_sbr_neg_odd_64）
+- signature: 完整函数签名
+- file: 所在源文件的相对路径
+- line: 函数定义起始行号
+- reason: 为什么适合迁移
+
+输出严格 JSON（不要额外文字）：
+{{
+  "symbol": "{symbol}",
+  "functions": [
+    {{
+      "name": "...",
+      "signature": "...",
+      "file": "...",
+      "line": 0,
+      "reason": "..."
+    }}
+  ],
+  "notes": "..."
+}}
+
+## 代码上下文
+{code_context[:8000]}
 """

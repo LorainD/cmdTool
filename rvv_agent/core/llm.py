@@ -19,7 +19,11 @@ class LlmMessage:
 
 
 class LlmError(RuntimeError):
-    pass
+    """Base class for LLM call failures."""
+    def __init__(self, message: str, *, retryable: bool = False, status_code: int = 0):
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,24 @@ def _endpoint_url(cfg: LlmConfig) -> str:
     return url
 
 
+def _is_retryable_http(status_code: int) -> bool:
+    """Check if an HTTP status code is retryable."""
+    return status_code in (429, 500, 502, 503, 504)
+
+
+def _is_retryable_error(err: Exception) -> bool:
+    """Check if an exception is retryable (network/timeout errors)."""
+    msg = str(err).lower()
+    if isinstance(err, LlmError):
+        return err.retryable
+    if isinstance(err, urllib.error.HTTPError):
+        return _is_retryable_http(err.code)
+    # Network / timeout errors
+    return any(kw in msg for kw in ("timeout", "timed out", "urlopen error",
+                                     "connection", "temporary failure",
+                                     "name resolution"))
+
+
 def chat_completion(
     cfg: LlmConfig,
     messages: list[LlmMessage],
@@ -252,8 +274,14 @@ def chat_completion(
     max_tokens: int = 2048,
     timeout_seconds: float = 120.0,
     stage: str = "llm",
+    max_retries: int = 2,
+    retry_delay: float = 3.0,
 ) -> str:
-    """Call the LLM and return the assistant text.
+    """Call the LLM and return the assistant text, with automatic retry.
+
+    Retryable errors (429, 5xx, timeout, network) are retried up to
+    *max_retries* times with linear backoff: delay = retry_delay * (attempt+1).
+    Non-retryable errors (401, 400) are raised immediately.
 
     Also appends a :class:`TrajectoryEvent` to the module-level trajectory so
     callers can save it to ``trajectory.json`` with :func:`get_trajectory_dict`.
@@ -271,14 +299,7 @@ def chat_completion(
         "messages": [{"role": m.role, "content": m.content} for m in messages],
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=_headers(api_key),
-        method="POST",
-    )
-
-    # Build prompt string for trajectory (last user message) – needed even on failure
+    # Build prompt string for trajectory (last user message)
     prompt_text = ""
     for m in reversed(messages):
         if m.role == "user":
@@ -286,80 +307,98 @@ def chat_completion(
             break
 
     price_in, price_out = _pricing_for_model(cfg)
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        elapsed = time.monotonic() - t0
-        body = ""
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            wait = retry_delay * attempt
+            print(f"[LLM] 重试 {attempt}/{max_retries}（等待 {wait:.0f}s）…")
+            time.sleep(wait)
+
+        t0 = time.monotonic()
         try:
-            body = e.read().decode("utf-8", errors="replace")  # type: ignore[attr-defined]
-        except Exception:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=_headers(api_key),
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            elapsed = time.monotonic() - t0
             body = ""
-        err_msg = f"HTTP {e.code} from {url}: {body[:2000]}"
-        _TRAJECTORY.record(
-            stage=stage + "_error",
-            prompt=prompt_text,
-            response=f"ERROR: {err_msg}",
-            input_tokens=0,
-            output_tokens=0,
-            cost_per_1m_in=price_in,
-            cost_per_1m_out=price_out,
-            elapsed=elapsed,
-        )
-        raise LlmError(err_msg) from e
-    except Exception as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            err_msg = f"HTTP {e.code} from {url}: {body[:2000]}"
+            _TRAJECTORY.record(
+                stage=stage + "_error",
+                prompt=prompt_text,
+                response=f"ERROR: {err_msg}",
+                input_tokens=0, output_tokens=0,
+                cost_per_1m_in=price_in, cost_per_1m_out=price_out,
+                elapsed=elapsed,
+            )
+            last_error = LlmError(err_msg, retryable=_is_retryable_http(e.code),
+                                   status_code=e.code)
+            if not _is_retryable_http(e.code) or attempt >= max_retries:
+                raise last_error from e
+            continue
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            err_msg = f"LLM request failed at {url}: {e}"
+            _TRAJECTORY.record(
+                stage=stage + "_error",
+                prompt=prompt_text,
+                response=f"ERROR: {err_msg}",
+                input_tokens=0, output_tokens=0,
+                cost_per_1m_in=price_in, cost_per_1m_out=price_out,
+                elapsed=elapsed,
+            )
+            last_error = LlmError(err_msg, retryable=_is_retryable_error(e))
+            if not _is_retryable_error(e) or attempt >= max_retries:
+                raise last_error from e
+            continue
+
         elapsed = time.monotonic() - t0
-        err_msg = f"LLM request failed at {url}: {e}"
+
+        try:
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+        except Exception as e:
+            err_msg = f"Unexpected LLM response: {raw[:2000]}"
+            _TRAJECTORY.record(
+                stage=stage + "_parse_error",
+                prompt=prompt_text,
+                response=f"ERROR: {err_msg}",
+                input_tokens=0, output_tokens=0,
+                cost_per_1m_in=price_in, cost_per_1m_out=price_out,
+                elapsed=elapsed,
+            )
+            raise LlmError(err_msg) from e
+
+        # Parse usage from response
+        usage = data.get("usage", {}) if isinstance(data, dict) else {}
+        input_tokens = int(usage.get("prompt_tokens", 0))
+        output_tokens = int(usage.get("completion_tokens", 0))
+
         _TRAJECTORY.record(
-            stage=stage + "_error",
+            stage=stage,
             prompt=prompt_text,
-            response=f"ERROR: {err_msg}",
-            input_tokens=0,
-            output_tokens=0,
+            response=content,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             cost_per_1m_in=price_in,
             cost_per_1m_out=price_out,
             elapsed=elapsed,
         )
-        raise LlmError(err_msg) from e
 
-    elapsed = time.monotonic() - t0
+        return content
 
-    try:
-        data = json.loads(raw)
-        content = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        err_msg = f"Unexpected LLM response: {raw[:2000]}"
-        _TRAJECTORY.record(
-            stage=stage + "_parse_error",
-            prompt=prompt_text,
-            response=f"ERROR: {err_msg}",
-            input_tokens=0,
-            output_tokens=0,
-            cost_per_1m_in=price_in,
-            cost_per_1m_out=price_out,
-            elapsed=elapsed,
-        )
-        raise LlmError(err_msg) from e
-
-    # Parse usage from response
-    usage = data.get("usage", {}) if isinstance(data, dict) else {}
-    input_tokens = int(usage.get("prompt_tokens", 0))
-    output_tokens = int(usage.get("completion_tokens", 0))
-
-    _TRAJECTORY.record(
-        stage=stage,
-        prompt=prompt_text,
-        response=content,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cost_per_1m_in=price_in,
-        cost_per_1m_out=price_out,
-        elapsed=elapsed,
-    )
-
-    return content
+    # Should not reach here, but just in case
+    raise last_error or LlmError("LLM call failed after retries")
 
 
 def probe_llm(cfg: LlmConfig) -> dict[str, object]:
