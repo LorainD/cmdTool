@@ -1,57 +1,58 @@
 # rvv-agent
 
-面向 FFmpeg 的 RVV（RISC-V Vector）汇编 SIMD 迁移命令行工具，支持 LLM 辅助的自动化与交互式操作。
+面向 FFmpeg 的 RVV (RISC-V Vector) 迁移命令行工具。当前版本基于状态机驱动，支持 `chat` 交互式流程和 `migrate` 非交互式流水线，包含 LLM 检索/分析/补丁生成、构建校验、失败回滚与知识库更新。
 
-## 功能概述
+## 功能概览
 
-- **意图解析**：理解自然语言指令，自动识别迁移目标算子
-- **智能检索**：LLM 辅助定位 C 实现 / x86 / ARM 参考文件及现有 RVV 实现
-- **LLM 代码生成**：生成 RVV 汇编（`.S`）、init 注册（`.c`）、Makefile patch，支持增量生成（不覆盖已有 RVV 函数）
-- **交互式人机协作**：每个关键决策点（写库、编译、scp、板端运行）均询问确认，会话内只问一次
-- **迭代修复**：构建失败时自动提取智能错误摘要，交给 LLM 修复，最多重试 3 次
-- **完整可追溯**：每次运行产物落盘到 `runs/<timestamp>_<symbol>/`，含 LLM 轨迹、构建日志、生成文件
-- **LLM 断连检测**：网络超时 / 认证失败 / 速率限制时以红字提醒，并给出操作建议
-- **远程板卡支持**：可选 sshpass + scp 把 checkasm 传到 RISC-V 硬件板并运行
+- 意图解析：在 `chat` 模式下支持普通问答与迁移任务自动识别。
+- 分层检索：先按 `symbol` 检索，必要时按 `module` 补充检索并去重。
+- 函数发现：`FUNC_DISCOVER` 阶段识别模块中可迁移函数，并形成 `function_order`。
+- 结构化补丁：`PATCH` 阶段采用 `locate -> design -> generate -> apply` 四步。
+- 增量注入：`.S` 文件优先追加，避免覆盖已有 RVV 代码；文本文件按锚点插入或末尾注入。
+- 调试闭环：`BUILD` 失败进入 `DEBUG`，按错误类型给出回滚目标并重试。
+- 全量落盘：每次运行写入 `runs/<task_id>_<symbol>/`，含状态文件、轨迹、报告、构建日志。
+- 经验记忆：成功迁移 pattern 与常见错误写入 `knowledge_base.json`，后续可被检索复用。
 
----
+## 当前目录结构
 
-## 目录结构
+```text
+bin/rvv-agent
+rvv_agent.toml
+knowledge_base.json
+runs/
+workplace/FFmpeg/
 
+rvv_agent/
+  cli.py
+  pipeline.py
+  core/
+    config.py
+    llm.py
+    statemachine.py
+    task.py
+    util.py
+    prompts.py
+    prompts_patch.py
+  agent/
+    chat.py
+    intent.py
+    search.py
+    analyze.py
+    plan.py
+    patch.py
+    debug.py
+    report.py
+    inject.py
+  tool/
+    exec.py
+    board.py
+    interactive.py
+  memory/
+    knowledge_base.py
+    pattern_lib.py
 ```
-bin/rvv-agent              CLI 入口脚本
-rvv_agent.toml             配置文件
-runs/                      每次运行的产物
-workplace/FFmpeg/          FFmpeg 工作区（vendor clone）
 
-rvv_agent/                 核心代码包
-├── __init__.py
-├── cli.py                 命令行入口（plan / migrate / chat 子命令）
-├── pipeline.py            非交互式 migrate 流水线
-│
-├── core/                  基础层（无业务依赖）
-│   ├── config.py          AppConfig / LlmConfig / 配置加载（rvv_agent.toml）
-│   ├── llm.py             LLM 客户端、trajectory 统计
-│   ├── prompts.py         所有 Prompt 模板
-│   └── util.py            通用工具（文件 I/O、shell、格式化等）
-│
-├── agent/                 Agent 层（核心智能逻辑）
-│   ├── chat.py            human-in-the-loop 交互式迁移循环
-│   ├── debug.py           非交互式 LLM 构建错误修复循环
-│   ├── generate.py        Plan / 语义分析 / LLM 代码生成与修复
-│   ├── intent.py          用户意图解析
-│   ├── report.py          运行报告落盘
-│   └── search.py          源码搜索、参考文件检索、上下文构建
-│
-├── tool/                  执行层（外部工具调用）
-│   ├── board.py           板端 scp / ssh 操作
-│   ├── exec.py            交叉编译（configure / make checkasm）
-│   └── interactive.py     终端交互（prompt_text / yes_no / secret）
-│
-└── memory/                经验记忆层（接口预留，待实现）
-    └── pattern_lib.py     RvvPattern / PatternLib stub
-```
-
----
+说明：当前实现中不再有 `agent/generate.py`，生成逻辑已并入 `agent/patch.py` 的四步流程。
 
 ## 快速开始
 
@@ -61,30 +62,43 @@ rvv_agent/                 核心代码包
 
 ```toml
 [llm]
-base_url    = "https://your-llm-endpoint/v1"   # OpenAI-compatible，自动补全 /chat/completions
-model       = "gpt-4o"
-api_key_env = "LLM_API_KEY"                    # 环境变量名，不要直接写 key
+base_url    = "https://your-endpoint/v1"   # 若未以 /chat/completions 结尾，会自动补全
+model       = "gpt-4o-mini"
+api_key_env = "LLM_API_KEY"
 temperature = 0.2
+# 可选：用于 trajectory 成本估算
+# cost_per_1m_input_tokens = 0
+# cost_per_1m_output_tokens = 0
 
 [toolchain]
 cross_prefix = "riscv64-unknown-linux-gnu-"
-arch         = "riscv64"
-target_os    = "linux"
-cpu          = "rv64gcv"
+arch = "riscv64"
+target_os = "linux"
+cpu = "rv64gcv"
 extra_cflags = "-march=rv64gcv -mabi=lp64d -O3"
 extra_ldflags = "-static"
-extra_path   = "/path/to/riscv-toolchain/bin"  # 追加到 PATH
+extra_path = "/path/to/riscv-toolchain/bin"  # 执行 configure/make 时会 prepend 到 PATH
 
 [ffmpeg]
-root      = "workplace/FFmpeg"
+root = "workplace/FFmpeg"
 build_dir = "build"
+# configure_path = "workplace/FFmpeg/configure"
+# configure_extra_args = ["--disable-everything"]
 
 [board]
-enabled    = false   # true 以启用板卡 scp/run
-user       = ""
-host       = ""
-port       = 22
+enabled = false
+user = ""
+host = ""
+port = 22
 remote_dir = "workplace"
+
+[human]
+# null 表示运行时询问；true/false 表示跳过询问直接执行
+# apply_ok = true
+# exec_ok = false
+# scp_ok = false
+# run_onboard_ok = false
+scp_password = ""
 ```
 
 设置 API key：
@@ -93,108 +107,84 @@ remote_dir = "workplace"
 export LLM_API_KEY='sk-...'
 ```
 
-### 2. 启动交互式对话（推荐）
+### 2. 交互模式（推荐）
 
 ```bash
 ./bin/rvv-agent chat
 ```
 
-启动后的典型流程：
+`chat` 模式要点：
 
-```
-> 迁移 sbrdsp.neg_odd_64 到 RVV
+- 普通问答：直接对话，保留最近上下文。
+- 迁移触发：输入包含 FFmpeg/libav 语境 + 迁移关键词时进入状态机流程。
+- 迁移状态流：`INTENT -> RETRIEVE -> FUNC_DISCOVER -> PLAN -> ANALYZE -> PATCH -> BUILD -> DEBUG(retry) -> KB_UPDATE -> DONE`。
+- 每轮结束后会生成 `report.md` 与 `trajectory.json`。
 
-📖 正在生成迁移计划…
-Plan：
-  1. 意图解析：迁移 sbrdsp.neg_odd_64
-  2. 定位 C 实现
-  ...
-
-确认按该 plan 继续？[Y/n]
-
-检索/选择出的参考文件：
-  libavcodec/aarch64/sbrdsp_neon.S
-  [existing-rvv] libavcodec/riscv/sbrdsp_rvv.S  ← 已有 RVV 文件，将增量生成
-  ...
-
-确认进入分析/生成阶段？[Y/n]
-
-⚙ 正在分析算子实现…
-⚙ 正在调用 LLM 生成 RVV 代码…（可能需要 20–60 秒）
-
-是否把生成文件写入 FFmpeg workspace？[y/N]
-是否执行 configure + 构建 checkasm？[y/N]
-```
-
-### 3. 自动化迁移
+### 3. 非交互迁移
 
 ```bash
-./bin/rvv-agent migrate ff_vp8_idct16_add          # 只落盘，不写库不编译
-./bin/rvv-agent migrate ff_vp8_idct16_add --apply  # 写入 FFmpeg workspace
-./bin/rvv-agent migrate ff_vp8_idct16_add --exec   # 同时执行交叉编译
+./bin/rvv-agent migrate <symbol>
+./bin/rvv-agent migrate <symbol> --apply
+./bin/rvv-agent migrate <symbol> --exec
+./bin/rvv-agent migrate <symbol> --apply --exec -j 16
 ```
 
-### 4. 查看迁移计划
+参数说明：
+
+- `--apply`：应用补丁到 FFmpeg workspace（否则只落盘到 `runs/`）。
+- `--exec`：执行 `configure + make tests/checkasm/checkasm`。
+- `--ffmpeg-root`：临时覆盖 `ffmpeg.root`。
+- `-j/--jobs`：并行构建线程数，`<=0` 自动取 CPU 核数。
+
+### 4. `plan` 子命令说明
+
+CLI 帮助中存在 `plan` 子命令，但当前代码里 `fixed_plan` 未导入，执行会触发 `NameError`。
 
 ```bash
-./bin/rvv-agent plan ff_vp8_idct16_add
+./bin/rvv-agent plan <symbol>
 ```
 
----
+当前版本请优先使用 `chat` 或 `migrate`。
 
-## 错误处理与修复循环
+## 构建与调试策略
 
-当 `configure` 或 `make checkasm` 失败时：
+- `BUILD` 阶段：先 `configure`，后 `make tests/checkasm/checkasm`。
+- 错误提取：从构建日志中提取关键错误行与尾部上下文。
+- `DEBUG` 分类：`compile_error` / `link_error` / `runtime_error` / `test_mismatch`。
+- 回滚目标：`locate` / `design` / `generate`，并驱动 `PATCH` 阶段针对性重试。
+- 最大调试轮次：`_MAX_DEBUG_CYCLES = 3`。
+- 状态机总迭代上限：`_MAX_ITERATIONS = 30`（防止死循环）。
+- LLM 调用重试：`core/llm.py` 默认 `max_retries=2`（网络/429/5xx 自动重试）。
 
-1. **智能错误提取**：不再简单截取前 N 字节，而是：
-   - 提取全部匹配 `error:`、`fatal error:`、`undefined reference`、`make[N]: Error` 等模式的行
-   - 取输出末尾 60 行（编译错误通常在最后）
-   - 按原始行号合并去重，从尾部截取至 4000 字符送给 LLM
-2. **LLM 修复**：最多重试 3 次（configure 和 make 共享计数器）
-3. **每轮日志**：全部构建输出追加到 `build_log.txt`，带轮次分隔头
+## 运行产物说明
 
-当 LLM 断线时，终端会以**红字**显示分类诊断：
+每次运行目录：`runs/<task_id>_<symbol>/`
 
-| 错误类型 | 提示 |
-|---------|------|
-| 网络超时 / 连接失败 | 检查网络 + `base_url` 配置 |
-| HTTP 401 / 403 | API key 无效或过期 |
-| HTTP 429 / quota | 速率限制，建议等待或换 key |
-| key 未设置 | 提示设置对应环境变量 |
+常见文件：
 
----
+- `user_input.txt`：用户输入（chat 模式）。
+- `retrieval_raw.txt`：参考文件筛选原始输出。
+- `context.txt`：供分析/生成使用的代码上下文。
+- `analysis.json`：语义分析结构化结果。
+- `build_log.txt`：构建失败摘要（含多轮追加）。
+- `report.md`：运行报告。
+- `trajectory.json`：LLM 与 action 轨迹、token 与成本统计。
+- `scp_stdout.txt` / `board_stdout.txt`：板端传输和执行输出（启用 board 时）。
 
-## 每次运行产物（`runs/<timestamp>_<symbol>/`）
+状态机持久化目录：`runs/.../state/`
 
-| 文件 | 内容 |
-|------|------|
-| `user_input.txt` | 用户原始输入及 refine 标记 |
-| `intent_raw.txt` | LLM 意图解析原始响应 |
-| `retrieval_raw.txt` | 检索过程 + 最终选定文件列表 |
-| `context.txt` | 送入分析阶段的代码上下文 |
-| `analysis.json` | LLM 结构化分析结果 |
-| `discovery.json` | 代码搜索匹配结果 |
-| `artifacts/package.json` | 生成的完整补丁包 |
-| `artifacts/files/...` | 生成的各文件副本 |
-| `build_log.txt` | 全部 configure + make 输出（含多轮迭代，带分隔头） |
-| `fix_attempt{N}_*.txt` | LLM 修复原始响应（每轮单独保存） |
-| `trajectory.json` | LLM 调用轨迹（tokens / cost / 耗时） |
-| `report.md` | 运行概览报告（不含原始构建输出） |
-| `board_stdout.txt` | 板端运行输出（启用 board 时） |
+- `task.json`：任务薄清单（当前状态、artifact 索引、回滚提示等）。
+- `<STAGE>.json` 或 `<STAGE>/<sub_id>.json`：各阶段 artifact。
 
----
+## 知识库 (`knowledge_base.json`)
 
-## 增量生成说明
-
-`.S` 汇编文件**不会被覆盖**：LLM 只输出新增函数，工具自动 append 到文件末尾，防止已有 RVV 实现丢失。
-
-`init.c` 和 `Makefile` 等文本文件以**全量替换**方式写入，LLM 在生成时会收到现有文件内容作为上下文。
-
----
+- `patterns`：成功迁移模式（语义 IR、SIMD 策略、架构信息、权重）。
+- `errors`：错误模式与修复策略（按计数累计）。
+- 在 `KB_UPDATE` 阶段自动更新，运行结束后保存。
 
 ## 注意事项
 
-- 交叉编译需要配置 RISC-V toolchain（`extra_path` 指向 `bin/`）
-- 板卡 scp 使用 sshpass 传递密码，安全性有限，建议改用 SSH key
-- LLM 调用会消耗 token，`trajectory.json` 记录每次费用
-- 生成的代码仍需人工审核，尤其是复杂算子
+- 交叉编译依赖 RISC-V 工具链，通常需配置 `toolchain.extra_path`。
+- 板端执行依赖 SSH；若系统安装 `sshpass` 会优先使用密码模式，否则走原生 `scp/ssh`。
+- LLM 生成代码仍需人工审核，尤其是汇编寄存器约束、尾处理与 ABI 细节。
+- 当前 README 基于仓库现有实现同步更新，后续改动请同时维护文档。

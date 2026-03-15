@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agent.chat import handle_analyze, handle_debug, handle_kb_update, handle_patch
-from .agent.generate import fixed_plan
+# from .agent.generate import fixed_plan
 from .agent.report import write_chat_report
 from .agent.search import build_context_from_files, select_references
 from .core.llm import get_trajectory_dict, record_trajectory_action, reset_trajectory
